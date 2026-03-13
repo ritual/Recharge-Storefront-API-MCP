@@ -8,16 +8,19 @@
  * Last updated: 2024-12-24
  */
 
+const debug = process.env.DEBUG === 'true';
+
+// Load environment variables first. Must use quiet: true so dotenv@17 does not write
+// to stdout (e.g. "[dotenv@17.x] injecting env..."), which would corrupt the MCP stdio JSON-RPC stream.
+import dotenv from 'dotenv';
+dotenv.config({ debug: debug, quiet: !debug });
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import dotenv from 'dotenv';
 import { RechargeClient } from './recharge-client.js';
 import { tools } from './tools/index.js';
 import { formatErrorResponse, validateAuthParams } from './utils/error-handler.js';
-
-// Load environment variables
-dotenv.config();
 
 /**
  * Server statistics tracking
@@ -71,7 +74,7 @@ function getHealthStatus() {
  * List available tools
  */
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error(`[DEBUG] Listing ${tools.length} available tools`);
   }
   
@@ -94,7 +97,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   serverStats.toolCalls++;
   serverStats.lastActivity = new Date();
   
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error(`[DEBUG] Executing tool: ${name}`);
     // Sanitize arguments for logging (remove sensitive data)
     const sanitizedArgs = { ...args };
@@ -108,7 +111,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (!tool) {
     serverStats.errors++;
     const error = new Error(`Tool not found: ${name}`);
-    if (process.env.DEBUG === 'true') {
+    if (debug) {
       console.error(`[DEBUG] Tool not found: ${name}`);
     }
     return formatErrorResponse(error);
@@ -205,7 +208,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Execute the tool
     const result = await tool.execute(client, validatedArgs);
     
-    if (process.env.DEBUG === 'true') {
+    if (debug) {
       console.error(`[DEBUG] Tool ${name} executed successfully`);
     }
     
@@ -213,7 +216,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (error) {
     serverStats.errors++;
     
-    if (process.env.DEBUG === 'true') {
+    if (debug) {
       console.error(`[DEBUG] Tool ${name} failed:`, error.message);
       if (error.stack) {
         console.error(`[DEBUG] Error stack:`, error.stack);
@@ -233,14 +236,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
  * Graceful shutdown handling
  */
 process.on('SIGINT', async () => {
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error('[DEBUG] Received SIGINT, shutting down gracefully...');
     console.error('[DEBUG] Final statistics:', serverStats);
   }
   
   try {
     await server.close();
-    if (process.env.DEBUG === 'true') {
+    if (debug) {
       console.error('[DEBUG] Server closed successfully');
     }
   } catch (error) {
@@ -251,7 +254,7 @@ process.on('SIGINT', async () => {
 });
 
 process.on('SIGTERM', async () => {
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error('[DEBUG] Received SIGTERM, shutting down gracefully...');
   }
   
@@ -324,7 +327,7 @@ async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     
-    if (process.env.DEBUG === 'true') {
+    if (debug) {
       console.error('[DEBUG] Recharge Storefront API MCP Server started');
       console.error('[DEBUG] Server name:', process.env.MCP_SERVER_NAME || 'recharge-storefront-api-mcp');
       console.error('[DEBUG] Server version:', process.env.MCP_SERVER_VERSION || '1.0.0');
@@ -332,9 +335,8 @@ async function main() {
       console.error('[DEBUG] Store domain:', hasStoreDomain ? process.env.RECHARGE_STOREFRONT_DOMAIN : 'Not configured');
       console.error('[DEBUG] Admin token:', hasAdminToken ? 'Configured' : 'Not configured');
       console.error('[DEBUG] Session token:', (process.env.RECHARGE_SESSION_TOKEN && process.env.RECHARGE_SESSION_TOKEN.trim() !== '') ? 'Configured' : 'Not configured');
+      console.error('[INFO] Server ready - listening for MCP requests');
     }
-    
-    console.error('[INFO] Server ready - listening for MCP requests');
     
   } catch (error) {
     console.error('[FATAL] Failed to start server:', error.message);
@@ -348,7 +350,7 @@ async function main() {
       console.error('[INFO] Permission error. Please check file permissions.');
     }
     
-    if (process.env.DEBUG === 'true') {
+    if (debug) {
       console.error('[DEBUG] Startup error stack:', error.stack);
     }
     process.exit(1);
@@ -358,7 +360,7 @@ async function main() {
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
   console.error('[FATAL] Uncaught exception:', error.message);
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error('[DEBUG] Error stack:', error.stack);
   }
   process.exit(1);
@@ -366,7 +368,7 @@ process.on('uncaughtException', (error) => {
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[FATAL] Unhandled rejection at:', promise, 'reason:', reason);
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error('[DEBUG] Rejection details:', reason);
   }
   process.exit(1);
@@ -375,7 +377,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // Start the server
 main().catch((error) => {
   console.error('[FATAL] Server startup failed:', error.message);
-  if (process.env.DEBUG === 'true') {
+  if (debug) {
     console.error('[DEBUG] Startup error stack:', error.stack);
   }
   process.exit(1);
