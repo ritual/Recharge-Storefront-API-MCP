@@ -3,7 +3,7 @@
  * Provides access to gift purchases and redemption
  * Last updated: 2026-02-05
  */
-import { z } from 'zod';
+import * as z from 'zod';
 
 const baseSchema = z.object({
     admin_token: z.string().optional().describe('Recharge admin token (optional, takes precedence over environment variable if provided)'),

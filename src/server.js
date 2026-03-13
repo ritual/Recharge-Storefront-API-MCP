@@ -286,7 +286,7 @@ async function main() {
     // Validate required dependencies
     try {
       const { Server } = await import('@modelcontextprotocol/sdk/server/index.js');
-      const { z } = await import('zod');
+      const z = await import('zod');
       const axios = await import('axios');
       const dotenv = await import('dotenv');
       

@@ -2,7 +2,7 @@
  * Plan management tools
  * Last updated: 2026-02-05
  */
-import { z } from 'zod';
+import * as z from 'zod';
 
 const baseSchema = z.object({
     customer_id: z.string().optional().describe('Customer ID for automatic session creation (optional, used when no session_token provided)'),

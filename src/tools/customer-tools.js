@@ -2,7 +2,7 @@
  * Customer management tools
  * Last updated: 2024-12-24
  */
-import { z } from 'zod';
+import * as z from 'zod';
 import { normalizeUnicodeText, validateUnicodeText, validatePhoneNumber } from '../utils/unicode-helpers.js';
 
 const baseSchema = z.object({
