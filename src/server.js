@@ -18,6 +18,7 @@ dotenv.config({ debug: debug, quiet: !debug });
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import * as z from 'zod';
 import { RechargeClient } from './recharge-client.js';
 import { tools } from './tools/index.js';
 import { formatErrorResponse, validateAuthParams } from './utils/error-handler.js';
@@ -82,7 +83,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: tools.map(tool => ({
       name: tool.name,
       description: tool.description,
-      inputSchema: tool.inputSchema,
+      inputSchema: z.toJSONSchema(tool.inputSchema),
     })),
   };
 });
