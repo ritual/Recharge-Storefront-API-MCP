@@ -13,17 +13,6 @@ export class RechargeClient {
       throw new Error('Store URL is required');
     }
 
-    // Validate that session token is not accidentally set to admin token
-    if (sessionToken && adminToken && sessionToken === adminToken) {
-      throw new Error(
-        'Configuration Error: session_token and admin_token cannot be the same value.\n' +
-        'You have set RECHARGE_SESSION_TOKEN to the same value as RECHARGE_ADMIN_TOKEN.\n' +
-        'Admin tokens cannot be used as session tokens.\n\n' +
-        'Fix: Remove RECHARGE_SESSION_TOKEN from your .env file or set it to a valid customer session token.\n' +
-        'The system will automatically create customer session tokens using your admin token when needed.'
-      );
-    }
-
     // Validate session token format if provided
     if (sessionToken) {
       const sessionValidation = this.validateSessionTokenFormat(sessionToken);
