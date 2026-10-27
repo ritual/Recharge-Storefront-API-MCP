@@ -3,6 +3,17 @@ import { handleAPIError } from './utils/error-handler.js';
 import { SessionCache } from './utils/session-cache.js';
 
 /**
+ * Resource IDs are interpolated into endpoint paths, so reject anything that
+ * could change which endpoint is called (dot segments, query, fragment, encoding)
+ */
+function assertSafeEndpoint(endpoint) {
+  const segments = endpoint.split('/').slice(1);
+  if (/[?#%\\]/.test(endpoint) || segments.some(segment => segment === '.' || segment === '..' || segment === '')) {
+    throw new Error(`Invalid API endpoint path: ${endpoint}. Resource IDs must be plain identifiers.`);
+  }
+}
+
+/**
  * Recharge Storefront API Client
  * Provides complete access to all Recharge Storefront API endpoints
  * Last updated: 2024-12-24
@@ -511,6 +522,8 @@ export class RechargeClient {
       throw new Error('API endpoint must start with /');
     }
 
+    assertSafeEndpoint(endpoint);
+
     try {
       sessionToken = sessionToken || await this.getOrCreateSessionToken(customerId, customerEmail);
     } catch (error) {
@@ -693,6 +706,8 @@ export class RechargeClient {
     if (!endpoint.startsWith('/')) {
       throw new Error('API endpoint must start with /');
     }
+
+    assertSafeEndpoint(endpoint);
 
     const config = {
       method: method.toUpperCase(),

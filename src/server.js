@@ -42,6 +42,8 @@ const serverStats = {
  */
 const hostedMode = process.env.MCP_HOSTED_MODE === 'true';
 const HOSTED_STRIPPED_ARGS = ['customer_id', 'session_token', 'admin_token', 'store_url'];
+const HOSTED_HANDOFF_HINT = 'Do not ask the customer for account IDs or tokens; hand off to a support agent.';
+const HOSTED_IDENTITY_ERRORS = /Customer not found with email|Multiple customers found with email|No session token available/;
 
 /**
  * Tools hidden from listing and rejected on call (comma-separated names)
@@ -162,6 +164,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     const validatedArgs = tool.inputSchema.parse(rawArgs);
 
+    if (hostedMode && !validatedArgs.customer_email) {
+      throw new Error(`This customer could not be identified because no verified email was provided. ${HOSTED_HANDOFF_HINT}`);
+    }
+
     // Validate authentication parameters
     validateAuthParams(validatedArgs);
 
@@ -264,7 +270,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         console.error(`[DEBUG] Error stack:`, error.stack);
       }
     }
-    
+
+    if (hostedMode && HOSTED_IDENTITY_ERRORS.test(error.message || '')) {
+      return formatErrorResponse(new Error(`${error.message} ${HOSTED_HANDOFF_HINT}`));
+    }
+
     return formatErrorResponse(error);
   }
 });
