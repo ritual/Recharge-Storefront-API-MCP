@@ -3,7 +3,7 @@
  * Last updated: 2024-12-24
  */
 import * as z from 'zod';
-import { shapeResponse, SUBSCRIPTION_FIELDS } from '../utils/response-shaping.js';
+import { shapeResponse, shapeChargeResponse, SUBSCRIPTION_FIELDS } from '../utils/response-shaping.js';
 
 const baseSchema = z.object({
   customer_id: z.string().optional().describe('Customer ID for automatic session creation (optional, used when no session_token provided)'),
@@ -657,7 +657,9 @@ export const subscriptionTools = [
     inputSchema: skipSubscriptionSchema,
     execute: async (client, args) => {
       const { subscription_id, date } = args;
-      const result = await client.skipSubscription(subscription_id, date, args.customer_id, args.customer_email, args.session_token);
+      const result = client.verifiedAdminWrites
+        ? shapeChargeResponse(await client.verifiedSkipSubscription(subscription_id, date, args.customer_email))
+        : await client.skipSubscription(subscription_id, date, args.customer_id, args.customer_email, args.session_token);
 
       return {
         content: [
@@ -718,7 +720,9 @@ export const subscriptionTools = [
     inputSchema: setNextChargeDateSchema,
     execute: async (client, args) => {
       const { subscription_id, date } = args;
-      const updatedSubscription = await client.setNextChargeDate(subscription_id, date, args.customer_id, args.customer_email, args.session_token);
+      const updatedSubscription = client.verifiedAdminWrites
+        ? shapeResponse(await client.verifiedSetNextChargeDate(subscription_id, date, args.customer_email), 'subscription', SUBSCRIPTION_FIELDS)
+        : await client.setNextChargeDate(subscription_id, date, args.customer_id, args.customer_email, args.session_token);
 
       return {
         content: [

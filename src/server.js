@@ -46,6 +46,18 @@ const HOSTED_HANDOFF_HINT = 'Do not ask the customer for account IDs or tokens; 
 const HOSTED_IDENTITY_ERRORS = /Customer not found with email|Multiple customers found with email|No session token available/;
 
 /**
+ * Verified admin writes: email-minted storefront sessions are read-only, so
+ * set_subscription_next_charge, skip_subscription, skip_charge and
+ * update_address instead check (with the admin token) that the target belongs
+ * to the customer identified by customer_email, then write with the admin
+ * token. On by default in hosted mode; MCP_VERIFIED_ADMIN_WRITES=true enables
+ * it without hosted mode and =false disables it in hosted mode.
+ */
+const verifiedAdminWrites = process.env.MCP_VERIFIED_ADMIN_WRITES === 'true' ||
+  (hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES !== 'false');
+const VERIFIED_WRITE_TOOLS = new Set(['set_subscription_next_charge', 'skip_subscription', 'update_address', 'skip_charge']);
+
+/**
  * Tools hidden from listing and rejected on call (comma-separated names)
  */
 const toolDenylist = new Set(
@@ -175,7 +187,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const storeUrl = validatedArgs.store_url || process.env.RECHARGE_STOREFRONT_DOMAIN;
     // In hosted mode every call must mint a session for the identified customer
     const sessionToken = hostedMode ? null : (validatedArgs.session_token || process.env.RECHARGE_SESSION_TOKEN);
-    const adminToken = validatedArgs.admin_token || process.env.RECHARGE_ADMIN_TOKEN;
+    // Verified writes act with the server's own admin token only, never a caller-supplied one
+    const verifiedWrite = verifiedAdminWrites && VERIFIED_WRITE_TOOLS.has(name);
+    const adminToken = verifiedWrite ? process.env.RECHARGE_ADMIN_TOKEN : (validatedArgs.admin_token || process.env.RECHARGE_ADMIN_TOKEN);
     
     // Validate required configuration
     if (!storeUrl) {
@@ -242,7 +256,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const client = new RechargeClient({
       storeUrl: domain,
       sessionToken,
-      adminToken
+      adminToken,
+      verifiedAdminWrites
     });
     
     // Track customer for statistics
@@ -271,7 +286,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
-    if (hostedMode && HOSTED_IDENTITY_ERRORS.test(error.message || '')) {
+    if (hostedMode && HOSTED_IDENTITY_ERRORS.test(error.message || '') && !/hand off to a support agent/.test(error.message)) {
       return formatErrorResponse(new Error(`${error.message} ${HOSTED_HANDOFF_HINT}`));
     }
 
@@ -386,6 +401,7 @@ async function main() {
       console.error('[DEBUG] Available tools:', tools.length);
       console.error('[DEBUG] Store domain:', hasStoreDomain ? process.env.RECHARGE_STOREFRONT_DOMAIN : 'Not configured');
       console.error('[DEBUG] Admin token:', hasAdminToken ? 'Configured' : 'Not configured');
+      console.error('[DEBUG] Verified admin writes:', verifiedAdminWrites ? 'Enabled' : 'Disabled');
       console.error('[DEBUG] Session token:', (process.env.RECHARGE_SESSION_TOKEN && process.env.RECHARGE_SESSION_TOKEN.trim() !== '') ? 'Configured' : 'Not configured');
       console.error('[INFO] Server ready - listening for MCP requests');
     }

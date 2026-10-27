@@ -738,13 +738,19 @@ export const addressTools = [
         };
       }
 
-      const updatedAddress = await client.updateAddress(
-        address_id,
-        addressData,
-        args.customer_id,
-        args.customer_email,
-        args.session_token,
-      );
+      const updatedAddress = client.verifiedAdminWrites
+        ? shapeResponse(
+            await client.verifiedUpdateAddress(address_id, addressData, args.customer_email),
+            "address",
+            ADDRESS_FIELDS,
+          )
+        : await client.updateAddress(
+            address_id,
+            addressData,
+            args.customer_id,
+            args.customer_email,
+            args.session_token,
+          );
 
       return {
         content: [

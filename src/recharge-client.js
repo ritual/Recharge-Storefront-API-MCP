@@ -13,13 +13,21 @@ function assertSafeEndpoint(endpoint) {
   }
 }
 
+const VERIFIED_HANDOFF = 'hand off to a support agent';
+
+function verifiedWriteRefusal(message) {
+  return new Error(message.includes(VERIFIED_HANDOFF)
+    ? message
+    : `${message} Do not ask the customer for account IDs or tokens; ${VERIFIED_HANDOFF}.`);
+}
+
 /**
  * Recharge Storefront API Client
  * Provides complete access to all Recharge Storefront API endpoints
  * Last updated: 2024-12-24
  */
 export class RechargeClient {
-  constructor({ storeUrl, sessionToken = null, adminToken = null }) {
+  constructor({ storeUrl, sessionToken = null, adminToken = null, verifiedAdminWrites = false }) {
     if (!storeUrl) {
       throw new Error('Store URL is required');
     }
@@ -62,6 +70,7 @@ export class RechargeClient {
     this.storeUrl = domain;
     this.sessionToken = sessionToken;
     this.adminToken = adminToken;
+    this.verifiedAdminWrites = verifiedAdminWrites === true;
     this.sessionCache = new SessionCache();
     this.currentDomain = domain; // Store current domain for cache management
 
@@ -1225,5 +1234,135 @@ export class RechargeClient {
       throw new Error('Notification type is required');
     }
     return await this.makeRequest('POST', '/customers/notifications', { notification_type: notificationType, ...options }, null, customerId, customerEmail, sessionToken);
+  }
+
+  // Verified Admin Writes
+  //
+  // Email-minted storefront sessions can read but not write (Recharge returns
+  // 403 "insufficient permissions (scopes)"). These methods instead resolve the
+  // customer from the verified email, load the target resource with the admin
+  // token, check it belongs to that customer, and only then write with the
+  // admin token. Caller-supplied tokens and customer IDs are never used.
+
+  /**
+   * Resolve the customer ID for a verified email, refusing missing, unknown
+   * or ambiguous emails. Always a fresh lookup (no cache) before a write.
+   */
+  async resolveVerifiedCustomerId(customerEmail) {
+    if (!customerEmail || typeof customerEmail !== 'string' || customerEmail.trim() === '') {
+      throw verifiedWriteRefusal('This customer could not be identified because no verified email was provided, so no change was made.');
+    }
+
+    let customer;
+    try {
+      customer = await this.getCustomerByEmail(customerEmail);
+    } catch (error) {
+      if (/Customer not found with email|Multiple customers found with email|Invalid email format/.test(error.message || '')) {
+        const message = error.message.endsWith('.') ? error.message : `${error.message}.`;
+        throw verifiedWriteRefusal(`${message} No change was made.`);
+      }
+      throw error;
+    }
+
+    return String(customer.id);
+  }
+
+  /**
+   * Load a resource with the admin token and confirm it belongs to the
+   * customer. Not-found and owned-by-someone-else get the same message so
+   * other customers' IDs can't be probed.
+   */
+  async getVerifiedOwnedResource(endpoint, key, customerId, label, listTool) {
+    const refusal = verifiedWriteRefusal(
+      `${label} was not found on this customer's account, so it was not changed. ` +
+      `Use ${listTool} to see this customer's records; if the one they mean is not listed, ${VERIFIED_HANDOFF}.`
+    );
+
+    let response;
+    try {
+      response = await this.makeAdminRequest('GET', endpoint);
+    } catch (error) {
+      if (error.statusCode === 404) {
+        throw refusal;
+      }
+      throw error;
+    }
+
+    const record = response && response[key];
+    const ownerId = record ? (record.customer_id ?? record.customer?.id) : undefined;
+    if (!record || ownerId === undefined || ownerId === null || String(ownerId) !== String(customerId)) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified write refused: ${endpoint} is not owned by customer ${customerId}`);
+      }
+      throw refusal;
+    }
+
+    return record;
+  }
+
+  async verifiedSetNextChargeDate(subscriptionId, date, customerEmail) {
+    if (!subscriptionId) {
+      throw new Error('Subscription ID is required');
+    }
+    if (!date) {
+      throw new Error('Date is required');
+    }
+    const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+    await this.getVerifiedOwnedResource(`/subscriptions/${subscriptionId}`, 'subscription', customerId, `Subscription ${subscriptionId}`, 'get_subscriptions');
+    return await this.makeAdminRequest('POST', `/subscriptions/${subscriptionId}/set_next_charge_date`, { date });
+  }
+
+  async verifiedSkipSubscription(subscriptionId, date, customerEmail) {
+    if (!subscriptionId) {
+      throw new Error('Subscription ID is required');
+    }
+    if (!date) {
+      throw new Error('Date is required for skipping subscription');
+    }
+    const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+    const subscription = await this.getVerifiedOwnedResource(`/subscriptions/${subscriptionId}`, 'subscription', customerId, `Subscription ${subscriptionId}`, 'get_subscriptions');
+    if (!subscription.address_id) {
+      throw verifiedWriteRefusal(`Subscription ${subscriptionId} has no address, so it could not be skipped.`);
+    }
+    // The Admin API has no per-subscription skip; skip the subscription's charge on that date via its address
+    return await this.makeAdminRequest('POST', `/addresses/${subscription.address_id}/charges/skip`, {
+      date,
+      subscription_ids: [Number(subscriptionId)],
+    });
+  }
+
+  async verifiedUpdateAddress(addressId, updateData, customerEmail) {
+    if (!addressId) {
+      throw new Error('Address ID is required');
+    }
+    if (!updateData || typeof updateData !== 'object') {
+      throw new Error('Update data is required');
+    }
+    const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+    await this.getVerifiedOwnedResource(`/addresses/${addressId}`, 'address', customerId, `Address ${addressId}`, 'get_addresses');
+    return await this.makeAdminRequest('PUT', `/addresses/${addressId}`, updateData);
+  }
+
+  async verifiedSkipCharge(chargeId, purchaseItemIds, customerEmail) {
+    if (!chargeId) {
+      throw new Error('Charge ID is required');
+    }
+    if (!Array.isArray(purchaseItemIds) || purchaseItemIds.length === 0) {
+      throw new Error('Purchase item IDs are required');
+    }
+    const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+    const charge = await this.getVerifiedOwnedResource(`/charges/${chargeId}`, 'charge', customerId, `Charge ${chargeId}`, 'get_charges');
+
+    // Only skip items that are actually on this (verified) charge
+    const chargeItemIds = new Set((charge.line_items || []).map(item => String(item.purchase_item_id)));
+    const foreign = purchaseItemIds.filter(id => !chargeItemIds.has(String(id)));
+    if (foreign.length > 0) {
+      throw verifiedWriteRefusal(
+        `Charge ${chargeId} does not include purchase item(s) ${foreign.join(', ')}, so it was not skipped. ` +
+        `Use get_charge to see the purchase_item_id of each line item; if the item they mean is not on it, ${VERIFIED_HANDOFF}.`
+      );
+    }
+
+    return await this.makeAdminRequest('POST', `/charges/${chargeId}/skip`, { purchase_item_ids: purchaseItemIds });
   }
 }

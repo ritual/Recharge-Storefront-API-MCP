@@ -3,6 +3,7 @@
  * Last updated: 2024-12-24
  */
 import * as z from 'zod';
+import { shapeChargeResponse } from '../utils/response-shaping.js';
 
 const baseSchema = z.object({
   customer_id: z.string().optional().describe('Customer ID for automatic session creation (optional, used when no session_token provided)'),
@@ -138,7 +139,9 @@ export const chargeTools = [
     }),
     execute: async (client, args) => {
       const { charge_id, purchase_item_ids } = args;
-      const result = await client.post(`/charges/${charge_id}/skip`, { purchase_item_ids }, args.customer_id, args.customer_email, args.session_token);
+      const result = client.verifiedAdminWrites
+        ? shapeChargeResponse(await client.verifiedSkipCharge(charge_id, purchase_item_ids, args.customer_email))
+        : await client.post(`/charges/${charge_id}/skip`, { purchase_item_ids }, args.customer_id, args.customer_email, args.session_token);
 
       return {
         content: [
