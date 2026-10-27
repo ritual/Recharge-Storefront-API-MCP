@@ -3,6 +3,7 @@
  * Last updated: 2024-12-24
  */
 import * as z from 'zod';
+import { shapeResponse, SUBSCRIPTION_FIELDS } from '../utils/response-shaping.js';
 
 const baseSchema = z.object({
   customer_id: z.string().optional().describe('Customer ID for automatic session creation (optional, used when no session_token provided)'),
@@ -188,7 +189,7 @@ export const subscriptionTools = [
         content: [
           {
             type: 'text',
-            text: `Subscriptions:\n${JSON.stringify(subscriptions, null, 2)}`,
+            text: `Subscriptions:\n${JSON.stringify(shapeResponse(subscriptions, 'subscriptions', SUBSCRIPTION_FIELDS))}`,
           },
         ],
       };
@@ -430,7 +431,7 @@ export const subscriptionTools = [
         content: [
           {
             type: 'text',
-            text: `Subscription Details:\n${JSON.stringify(subscription, null, 2)}`,
+            text: `Subscription Details:\n${JSON.stringify(shapeResponse(subscription, 'subscription', SUBSCRIPTION_FIELDS))}`,
           },
         ],
       };
