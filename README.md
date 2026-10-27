@@ -633,6 +633,7 @@ DEBUG=true
 | `DEBUG` | No | Enable debug logging | `true` |
 | `MCP_HOSTED_MODE` | No | Lock down for customer-facing clients (see below) | `true` |
 | `MCP_TOOL_DENYLIST` | No | Comma-separated tool names to hide and reject | `cancel_subscription,process_charge` |
+| `MCP_VERIFIED_ADMIN_WRITES` | No | Ownership-checked admin writes, hosted mode only (default: on in hosted mode; `false` turns it off; see below) | `false` |
 
 *Required unless provided in each tool call
 
@@ -644,6 +645,26 @@ Set `MCP_HOSTED_MODE=true` when the server sits behind a customer-facing assista
 - `RECHARGE_SESSION_TOKEN` is ignored; every call mints a session for the customer identified by `customer_email`.
 
 Independently of hosted mode, a lookup by email that matches more than one Recharge customer fails instead of picking the first match.
+
+### Verified Admin Writes
+
+Storefront sessions minted for a customer by email can read but not write: Recharge returns 403 "You do not have sufficient permissions (scopes) for this object" on writes such as `set_next_charge_date` and `PUT /addresses/{id}`. With verified admin writes enabled, these tools no longer use the storefront session:
+
+| Tool | Ownership check (admin API) | Write (admin API) |
+|------|-----------------------------|-------------------|
+| `set_subscription_next_charge` | `GET /subscriptions/{id}` → `customer_id` | `POST /subscriptions/{id}/set_next_charge_date` |
+| `skip_subscription` | `GET /subscriptions/{id}` → `customer_id` | `POST /addresses/{address_id}/charges/skip` |
+| `update_address` | `GET /addresses/{id}` → `customer_id` | `PUT /addresses/{id}` |
+| `skip_charge` | `GET /charges/{id}` → `customer.id`, and every `purchase_item_id` is on the charge | `POST /charges/{id}/skip` |
+
+Each call looks the customer up by `customer_email` (refusing 0 or >1 matches), loads the target with the admin token, and only writes if it belongs to that customer. Missing email, unknown or ambiguous email, not-found and owned-by-someone-else are all refused before any write is sent, with an error telling the assistant to hand off to a support agent. Not-found and wrong-owner get the same message, so other customers' IDs can't be probed. `session_token`, `customer_id` and `admin_token` from the caller are never used by these tools; read tools are unchanged.
+
+- Only available with `MCP_HOSTED_MODE=true`, and enabled by default there.
+- `MCP_VERIFIED_ADMIN_WRITES=false` disables it in hosted mode (falls back to storefront-session writes).
+- Without hosted mode it is always off, and `MCP_VERIFIED_ADMIN_WRITES=true` is ignored with a startup warning.
+- `MCP_VERIFIED_ADMIN_WRITES=transitional` (hosted mode off only) is a cutover aid: a write call with `customer_email` and no `session_token`/`admin_token` takes the verified path, while calls that still pass a token keep the legacy behaviour. Use it only while migrating a client from token-based writes to email-based ones, then turn hosted mode on and remove it. The ownership check is only as strong as the source of `customer_email`: in hosted mode the client maps it from a verified contact, but otherwise the caller supplies it, so enabling these writes there would let any caller make admin-token writes for any customer whose email they know.
+- Subscription, address and charge IDs must be digits only, the fetched record's `id` must match the requested ID, and the write uses the IDs from the verified record (for `skip_charge`, the charge's own `purchase_item_id`s), never the raw input.
+- `RECHARGE_ADMIN_TOKEN` needs `read_customers`/`write_customers` (lookup, addresses), `read_subscriptions`/`write_subscriptions` and `read_orders`/`write_orders` (charges).
 
 ### Important: API URL Behavior
 

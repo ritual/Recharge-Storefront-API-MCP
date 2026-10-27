@@ -45,6 +45,27 @@ export const ADDRESS_FIELDS = [
   'phone',
 ];
 
+export const CHARGE_FIELDS = [
+  'id',
+  'address_id',
+  'status',
+  'type',
+  'scheduled_at',
+  'currency',
+  'subtotal_price',
+  'total_price',
+];
+
+export const CHARGE_LINE_ITEM_FIELDS = [
+  'purchase_item_id',
+  'purchase_item_type',
+  'title',
+  'variant_title',
+  'sku',
+  'quantity',
+  'total_price',
+];
+
 export function pickFields(record, fields) {
   if (!record || typeof record !== 'object') {
     return record;
@@ -73,4 +94,18 @@ export function shapeResponse(response, key, fields) {
       ? value.map(item => pickFields(item, fields))
       : pickFields(value, fields),
   };
+}
+
+/**
+ * Shape a `{ charge }` response, keeping a trimmed copy of its line items.
+ */
+export function shapeChargeResponse(response) {
+  if (!response || typeof response !== 'object' || !response.charge || typeof response.charge !== 'object') {
+    return response;
+  }
+  const charge = pickFields(response.charge, CHARGE_FIELDS);
+  if (Array.isArray(response.charge.line_items)) {
+    charge.line_items = response.charge.line_items.map(item => pickFields(item, CHARGE_LINE_ITEM_FIELDS));
+  }
+  return { ...response, charge };
 }
