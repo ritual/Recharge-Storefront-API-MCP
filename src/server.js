@@ -58,6 +58,14 @@ const HOSTED_IDENTITY_ERRORS = /Customer not found with email|Multiple customers
  */
 const verifiedAdminWrites = hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES !== 'false';
 const verifiedAdminWritesIgnored = !hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES === 'true';
+/**
+ * Cutover aid for clients migrating from token-based writes: outside hosted
+ * mode, MCP_VERIFIED_ADMIN_WRITES=transitional sends a write call through the
+ * verified path only when it carries customer_email and no session/admin
+ * token; calls that still pass a token keep the legacy behaviour. Remove once
+ * every client sends customer_email and hosted mode is on.
+ */
+const verifiedAdminWritesTransitional = !hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES === 'transitional';
 const VERIFIED_WRITE_TOOLS = new Set(['set_subscription_next_charge', 'skip_subscription', 'update_address', 'skip_charge']);
 
 /**
@@ -191,7 +199,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // In hosted mode every call must mint a session for the identified customer
     const sessionToken = hostedMode ? null : (validatedArgs.session_token || process.env.RECHARGE_SESSION_TOKEN);
     // Verified writes act with the server's own admin token only, never a caller-supplied one
-    const verifiedWrite = verifiedAdminWrites && VERIFIED_WRITE_TOOLS.has(name);
+    const verifiedWrite = VERIFIED_WRITE_TOOLS.has(name) && (verifiedAdminWrites || (
+      verifiedAdminWritesTransitional &&
+      Boolean(validatedArgs.customer_email) &&
+      !validatedArgs.session_token &&
+      !validatedArgs.admin_token
+    ));
     const adminToken = verifiedWrite ? process.env.RECHARGE_ADMIN_TOKEN : (validatedArgs.admin_token || process.env.RECHARGE_ADMIN_TOKEN);
     
     // Validate required configuration
@@ -260,7 +273,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       storeUrl: domain,
       sessionToken,
       adminToken,
-      verifiedAdminWrites
+      verifiedAdminWrites: verifiedWrite
     });
     
     // Track customer for statistics
@@ -408,7 +421,7 @@ async function main() {
       console.error('[DEBUG] Available tools:', tools.length);
       console.error('[DEBUG] Store domain:', hasStoreDomain ? process.env.RECHARGE_STOREFRONT_DOMAIN : 'Not configured');
       console.error('[DEBUG] Admin token:', hasAdminToken ? 'Configured' : 'Not configured');
-      console.error('[DEBUG] Verified admin writes:', verifiedAdminWrites ? 'Enabled' : 'Disabled');
+      console.error('[DEBUG] Verified admin writes:', verifiedAdminWrites ? 'Enabled' : (verifiedAdminWritesTransitional ? 'Transitional' : 'Disabled'));
       console.error('[DEBUG] Session token:', (process.env.RECHARGE_SESSION_TOKEN && process.env.RECHARGE_SESSION_TOKEN.trim() !== '') ? 'Configured' : 'Not configured');
       console.error('[INFO] Server ready - listening for MCP requests');
     }

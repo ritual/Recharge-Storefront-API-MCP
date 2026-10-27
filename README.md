@@ -661,7 +661,8 @@ Each call looks the customer up by `customer_email` (refusing 0 or >1 matches), 
 
 - Only available with `MCP_HOSTED_MODE=true`, and enabled by default there.
 - `MCP_VERIFIED_ADMIN_WRITES=false` disables it in hosted mode (falls back to storefront-session writes).
-- Without hosted mode it is always off, and `MCP_VERIFIED_ADMIN_WRITES=true` is ignored with a startup warning. The ownership check is only as strong as the source of `customer_email`: in hosted mode the client maps it from a verified contact, but otherwise the caller supplies it, so enabling these writes there would let any caller make admin-token writes for any customer whose email they know.
+- Without hosted mode it is always off, and `MCP_VERIFIED_ADMIN_WRITES=true` is ignored with a startup warning.
+- `MCP_VERIFIED_ADMIN_WRITES=transitional` (hosted mode off only) is a cutover aid: a write call with `customer_email` and no `session_token`/`admin_token` takes the verified path, while calls that still pass a token keep the legacy behaviour. Use it only while migrating a client from token-based writes to email-based ones, then turn hosted mode on and remove it. The ownership check is only as strong as the source of `customer_email`: in hosted mode the client maps it from a verified contact, but otherwise the caller supplies it, so enabling these writes there would let any caller make admin-token writes for any customer whose email they know.
 - Subscription, address and charge IDs must be digits only, the fetched record's `id` must match the requested ID, and the write uses the IDs from the verified record (for `skip_charge`, the charge's own `purchase_item_id`s), never the raw input.
 - `RECHARGE_ADMIN_TOKEN` needs `read_customers`/`write_customers` (lookup, addresses), `read_subscriptions`/`write_subscriptions` and `read_orders`/`write_orders` (charges).
 
