@@ -50,11 +50,14 @@ const HOSTED_IDENTITY_ERRORS = /Customer not found with email|Multiple customers
  * set_subscription_next_charge, skip_subscription, skip_charge and
  * update_address instead check (with the admin token) that the target belongs
  * to the customer identified by customer_email, then write with the admin
- * token. On by default in hosted mode; MCP_VERIFIED_ADMIN_WRITES=true enables
- * it without hosted mode and =false disables it in hosted mode.
+ * token. Only available in hosted mode, where customer_email comes from the
+ * client's verified contact rather than the caller: on by default there, and
+ * MCP_VERIFIED_ADMIN_WRITES=false turns it off. Outside hosted mode the email
+ * is caller-asserted, so MCP_VERIFIED_ADMIN_WRITES=true is ignored (with a
+ * startup warning) rather than letting any caller write to any customer.
  */
-const verifiedAdminWrites = process.env.MCP_VERIFIED_ADMIN_WRITES === 'true' ||
-  (hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES !== 'false');
+const verifiedAdminWrites = hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES !== 'false';
+const verifiedAdminWritesIgnored = !hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES === 'true';
 const VERIFIED_WRITE_TOOLS = new Set(['set_subscription_next_charge', 'skip_subscription', 'update_address', 'skip_charge']);
 
 /**
@@ -384,6 +387,10 @@ async function main() {
     
     if (process.env.RECHARGE_STOREFRONT_DOMAIN === 'your-shop.myshopify.com') {
       console.error('[WARNING] Please update RECHARGE_STOREFRONT_DOMAIN with your actual domain');
+    }
+    
+    if (verifiedAdminWritesIgnored) {
+      console.error('[WARNING] MCP_VERIFIED_ADMIN_WRITES=true is ignored without MCP_HOSTED_MODE=true (customer_email is only trusted in hosted mode)');
     }
     
     if (process.env.RECHARGE_ADMIN_TOKEN === 'your_admin_token_here') {

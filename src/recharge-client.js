@@ -1268,15 +1268,30 @@ export class RechargeClient {
   }
 
   /**
-   * Load a resource with the admin token and confirm it belongs to the
-   * customer. Not-found and owned-by-someone-else get the same message so
-   * other customers' IDs can't be probed.
+   * Resource IDs used by verified writes must be plain digits, so the record
+   * checked for ownership and the record written are always the same one.
    */
-  async getVerifiedOwnedResource(endpoint, key, customerId, label, listTool) {
+  assertVerifiedId(id, label, listTool) {
+    if (!/^\d+$/.test(String(id ?? ''))) {
+      throw verifiedWriteRefusal(
+        `${label} ID "${id}" is not a valid ID (IDs are digits only), so nothing was changed. ` +
+        `Use ${listTool} to find the right ID; if the one they mean is not listed, ${VERIFIED_HANDOFF}.`
+      );
+    }
+    return String(id);
+  }
+
+  /**
+   * Load a resource with the admin token and confirm it is the requested
+   * record and belongs to the customer. Not-found and owned-by-someone-else
+   * get the same message so other customers' IDs can't be probed.
+   */
+  async getVerifiedOwnedResource(collection, id, key, customerId, label, listTool) {
     const refusal = verifiedWriteRefusal(
-      `${label} was not found on this customer's account, so it was not changed. ` +
+      `${label} ${id} was not found on this customer's account, so it was not changed. ` +
       `Use ${listTool} to see this customer's records; if the one they mean is not listed, ${VERIFIED_HANDOFF}.`
     );
+    const endpoint = `/${collection}/${id}`;
 
     let response;
     try {
@@ -1290,7 +1305,8 @@ export class RechargeClient {
 
     const record = response && response[key];
     const ownerId = record ? (record.customer_id ?? record.customer?.id) : undefined;
-    if (!record || ownerId === undefined || ownerId === null || String(ownerId) !== String(customerId)) {
+    if (!record || String(record.id) !== String(id) ||
+        ownerId === undefined || ownerId === null || String(ownerId) !== String(customerId)) {
       if (process.env.DEBUG === 'true') {
         console.error(`[DEBUG] Verified write refused: ${endpoint} is not owned by customer ${customerId}`);
       }
@@ -1307,9 +1323,10 @@ export class RechargeClient {
     if (!date) {
       throw new Error('Date is required');
     }
+    const id = this.assertVerifiedId(subscriptionId, 'Subscription', 'get_subscriptions');
     const customerId = await this.resolveVerifiedCustomerId(customerEmail);
-    await this.getVerifiedOwnedResource(`/subscriptions/${subscriptionId}`, 'subscription', customerId, `Subscription ${subscriptionId}`, 'get_subscriptions');
-    return await this.makeAdminRequest('POST', `/subscriptions/${subscriptionId}/set_next_charge_date`, { date });
+    const subscription = await this.getVerifiedOwnedResource('subscriptions', id, 'subscription', customerId, 'Subscription', 'get_subscriptions');
+    return await this.makeAdminRequest('POST', `/subscriptions/${subscription.id}/set_next_charge_date`, { date });
   }
 
   async verifiedSkipSubscription(subscriptionId, date, customerEmail) {
@@ -1319,15 +1336,17 @@ export class RechargeClient {
     if (!date) {
       throw new Error('Date is required for skipping subscription');
     }
+    const id = this.assertVerifiedId(subscriptionId, 'Subscription', 'get_subscriptions');
     const customerId = await this.resolveVerifiedCustomerId(customerEmail);
-    const subscription = await this.getVerifiedOwnedResource(`/subscriptions/${subscriptionId}`, 'subscription', customerId, `Subscription ${subscriptionId}`, 'get_subscriptions');
+    const subscription = await this.getVerifiedOwnedResource('subscriptions', id, 'subscription', customerId, 'Subscription', 'get_subscriptions');
     if (!subscription.address_id) {
-      throw verifiedWriteRefusal(`Subscription ${subscriptionId} has no address, so it could not be skipped.`);
+      throw verifiedWriteRefusal(`Subscription ${id} has no address, so it could not be skipped.`);
     }
     // The Admin API has no per-subscription skip; skip the subscription's charge on that date via its address
     return await this.makeAdminRequest('POST', `/addresses/${subscription.address_id}/charges/skip`, {
       date,
-      subscription_ids: [Number(subscriptionId)],
+      // The verified record's own ID, never the raw input
+      subscription_ids: [subscription.id],
     });
   }
 
@@ -1338,9 +1357,10 @@ export class RechargeClient {
     if (!updateData || typeof updateData !== 'object') {
       throw new Error('Update data is required');
     }
+    const id = this.assertVerifiedId(addressId, 'Address', 'get_addresses');
     const customerId = await this.resolveVerifiedCustomerId(customerEmail);
-    await this.getVerifiedOwnedResource(`/addresses/${addressId}`, 'address', customerId, `Address ${addressId}`, 'get_addresses');
-    return await this.makeAdminRequest('PUT', `/addresses/${addressId}`, updateData);
+    const address = await this.getVerifiedOwnedResource('addresses', id, 'address', customerId, 'Address', 'get_addresses');
+    return await this.makeAdminRequest('PUT', `/addresses/${address.id}`, updateData);
   }
 
   async verifiedSkipCharge(chargeId, purchaseItemIds, customerEmail) {
@@ -1350,19 +1370,22 @@ export class RechargeClient {
     if (!Array.isArray(purchaseItemIds) || purchaseItemIds.length === 0) {
       throw new Error('Purchase item IDs are required');
     }
+    const id = this.assertVerifiedId(chargeId, 'Charge', 'get_charges');
     const customerId = await this.resolveVerifiedCustomerId(customerEmail);
-    const charge = await this.getVerifiedOwnedResource(`/charges/${chargeId}`, 'charge', customerId, `Charge ${chargeId}`, 'get_charges');
+    const charge = await this.getVerifiedOwnedResource('charges', id, 'charge', customerId, 'Charge', 'get_charges');
 
-    // Only skip items that are actually on this (verified) charge
-    const chargeItemIds = new Set((charge.line_items || []).map(item => String(item.purchase_item_id)));
-    const foreign = purchaseItemIds.filter(id => !chargeItemIds.has(String(id)));
+    // Only skip items that are actually on this (verified) charge, sending the charge's own item IDs
+    const chargeItems = new Map((charge.line_items || []).map(item => [String(item.purchase_item_id), item.purchase_item_id]));
+    const foreign = purchaseItemIds.filter(itemId => !chargeItems.has(String(itemId)));
     if (foreign.length > 0) {
       throw verifiedWriteRefusal(
-        `Charge ${chargeId} does not include purchase item(s) ${foreign.join(', ')}, so it was not skipped. ` +
+        `Charge ${id} does not include purchase item(s) ${foreign.join(', ')}, so it was not skipped. ` +
         `Use get_charge to see the purchase_item_id of each line item; if the item they mean is not on it, ${VERIFIED_HANDOFF}.`
       );
     }
 
-    return await this.makeAdminRequest('POST', `/charges/${chargeId}/skip`, { purchase_item_ids: purchaseItemIds });
+    return await this.makeAdminRequest('POST', `/charges/${charge.id}/skip`, {
+      purchase_item_ids: purchaseItemIds.map(itemId => chargeItems.get(String(itemId))),
+    });
   }
 }
