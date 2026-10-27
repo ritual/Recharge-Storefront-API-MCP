@@ -35,6 +35,40 @@ const serverStats = {
 };
 
 /**
+ * Hosted mode (e.g. behind Intercom Fin): the customer is identified only by
+ * customer_email, which the client maps from a verified contact attribute.
+ * IDs, tokens and store overrides that a model could fill in from the
+ * conversation are removed from tool schemas and ignored on calls.
+ */
+const hostedMode = process.env.MCP_HOSTED_MODE === 'true';
+const HOSTED_STRIPPED_ARGS = ['customer_id', 'session_token', 'admin_token', 'store_url'];
+
+/**
+ * Tools hidden from listing and rejected on call (comma-separated names)
+ */
+const toolDenylist = new Set(
+  (process.env.MCP_TOOL_DENYLIST || '')
+    .split(',')
+    .map(name => name.trim())
+    .filter(Boolean)
+);
+const exposedTools = tools.filter(tool => !toolDenylist.has(tool.name));
+
+function toListedSchema(inputSchema) {
+  const jsonSchema = z.toJSONSchema(inputSchema);
+  if (!hostedMode || !jsonSchema.properties) {
+    return jsonSchema;
+  }
+  for (const arg of HOSTED_STRIPPED_ARGS) {
+    delete jsonSchema.properties[arg];
+  }
+  if (Array.isArray(jsonSchema.required)) {
+    jsonSchema.required = jsonSchema.required.filter(arg => !HOSTED_STRIPPED_ARGS.includes(arg));
+  }
+  return jsonSchema;
+}
+
+/**
  * MCP Server instance
  */
 const server = new Server(
@@ -76,14 +110,14 @@ function getHealthStatus() {
  */
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (debug) {
-    console.error(`[DEBUG] Listing ${tools.length} available tools`);
+    console.error(`[DEBUG] Listing ${exposedTools.length} available tools`);
   }
-  
+
   return {
-    tools: tools.map(tool => ({
+    tools: exposedTools.map(tool => ({
       name: tool.name,
       description: tool.description,
-      inputSchema: z.toJSONSchema(tool.inputSchema),
+      inputSchema: toListedSchema(tool.inputSchema),
     })),
   };
 });
@@ -108,7 +142,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   // Find the requested tool
-  const tool = tools.find(t => t.name === name);
+  const tool = exposedTools.find(t => t.name === name);
   if (!tool) {
     serverStats.errors++;
     const error = new Error(`Tool not found: ${name}`);
@@ -120,14 +154,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     // Validate input schema
-    const validatedArgs = tool.inputSchema.parse(args || {});
-    
+    const rawArgs = { ...(args || {}) };
+    if (hostedMode) {
+      for (const arg of HOSTED_STRIPPED_ARGS) {
+        delete rawArgs[arg];
+      }
+    }
+    const validatedArgs = tool.inputSchema.parse(rawArgs);
+
     // Validate authentication parameters
     validateAuthParams(validatedArgs);
-    
+
     // Extract authentication and configuration
     const storeUrl = validatedArgs.store_url || process.env.RECHARGE_STOREFRONT_DOMAIN;
-    const sessionToken = validatedArgs.session_token || process.env.RECHARGE_SESSION_TOKEN;
+    // In hosted mode every call must mint a session for the identified customer
+    const sessionToken = hostedMode ? null : (validatedArgs.session_token || process.env.RECHARGE_SESSION_TOKEN);
     const adminToken = validatedArgs.admin_token || process.env.RECHARGE_ADMIN_TOKEN;
     
     // Validate required configuration

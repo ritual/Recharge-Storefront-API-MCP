@@ -8,6 +8,7 @@ import {
   validatePostalCode,
   validatePhoneNumber,
 } from "../utils/unicode-helpers.js";
+import { shapeResponse, ADDRESS_FIELDS } from "../utils/response-shaping.js";
 
 const baseSchema = z.object({
   customer_id: z
@@ -505,7 +506,7 @@ export const addressTools = [
         content: [
           {
             type: "text",
-            text: `Addresses:\n${JSON.stringify(addresses, null, 2)}`,
+            text: `Addresses:\n${JSON.stringify(shapeResponse(addresses, "addresses", ADDRESS_FIELDS))}`,
           },
         ],
       };
@@ -528,7 +529,7 @@ export const addressTools = [
         content: [
           {
             type: "text",
-            text: `Address Details:\n${JSON.stringify(address, null, 2)}`,
+            text: `Address Details:\n${JSON.stringify(shapeResponse(address, "address", ADDRESS_FIELDS))}`,
           },
         ],
       };

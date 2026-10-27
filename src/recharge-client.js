@@ -757,6 +757,11 @@ export class RechargeClient {
         throw new Error(`Customer not found with email: ${email}`);
       }
 
+      // Never guess between accounts sharing an email
+      if (response.customers.length > 1) {
+        throw new Error(`Multiple customers found with email: ${email}. This needs to be resolved by a support agent.`);
+      }
+
       const customer = response.customers[0];
       if (!customer || !customer.id) {
         throw new Error('Customer data is incomplete - missing ID');

@@ -631,8 +631,19 @@ DEBUG=true
 | `MCP_SERVER_NAME` | No | Server identification | `recharge-mcp` |
 | `MCP_SERVER_VERSION` | No | Server version | `1.0.0` |
 | `DEBUG` | No | Enable debug logging | `true` |
+| `MCP_HOSTED_MODE` | No | Lock down for customer-facing clients (see below) | `true` |
+| `MCP_TOOL_DENYLIST` | No | Comma-separated tool names to hide and reject | `cancel_subscription,process_charge` |
 
 *Required unless provided in each tool call
+
+### Hosted Mode
+
+Set `MCP_HOSTED_MODE=true` when the server sits behind a customer-facing assistant (e.g. Intercom Fin). In hosted mode:
+
+- `customer_id`, `session_token`, `admin_token` and `store_url` are removed from every tool schema and ignored if sent, so a model can't fill them in from the conversation. Map `customer_email` from a verified contact attribute in your client.
+- `RECHARGE_SESSION_TOKEN` is ignored; every call mints a session for the customer identified by `customer_email`.
+
+Independently of hosted mode, a lookup by email that matches more than one Recharge customer fails instead of picking the first match.
 
 ### Important: API URL Behavior
 
