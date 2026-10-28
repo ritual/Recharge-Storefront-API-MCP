@@ -44,6 +44,11 @@ export function parseAddableVariants(raw) {
       continue;
     }
     const [, productId, variantId] = match;
+    // Variant IDs travel as JSON numbers (create_onetime/create_subscription variant_id), so they must be exact
+    if (!Number.isSafeInteger(Number(variantId))) {
+      warnings.push(`MCP_VERIFIED_ADDABLE_VARIANTS entry "${entry}" has a variant ID too large to pass as a number; ignored`);
+      continue;
+    }
     if (variants.has(variantId) && variants.get(variantId) !== productId) {
       warnings.push(`MCP_VERIFIED_ADDABLE_VARIANTS entry "${entry}" lists variant ${variantId} under a second product; ignored`);
       continue;
@@ -74,16 +79,24 @@ export function verifiedArgsRefusalMessage(tool, disallowed) {
 }
 
 /**
+ * Verified write tools that buy or multiply product. They take the verified
+ * path only in hosted mode, never in transitional mode, where customer_email
+ * is whatever the caller asserts.
+ */
+export const HOSTED_ONLY_VERIFIED_TOOLS = new Set(['update_subscription', 'create_onetime', 'create_subscription']);
+
+/**
  * Whether a call to a verified write tool takes the verified path. In hosted
  * mode that is every call; in transitional mode only calls that carry
- * customer_email and no session or admin token.
+ * customer_email and no session or admin token, and never the hosted-only tools.
  */
-export function isVerifiedWriteCall(name, args, { verifiedTools, verifiedAdminWrites, transitional }) {
+export function isVerifiedWriteCall(name, args, { verifiedTools, verifiedAdminWrites, transitional, hostedOnlyTools = HOSTED_ONLY_VERIFIED_TOOLS }) {
   if (!verifiedTools.has(name)) {
     return false;
   }
   return verifiedAdminWrites || (
     transitional &&
+    !hostedOnlyTools.has(name) &&
     Boolean(args && args.customer_email) &&
     !(args && args.session_token) &&
     !(args && args.admin_token)
@@ -93,7 +106,8 @@ export function isVerifiedWriteCall(name, args, { verifiedTools, verifiedAdminWr
 /**
  * The JSON schema a client is shown for a tool. Hosted mode hides caller IDs
  * and tokens; with verified admin writes on, a tool with verifiedArgs also
- * only shows the arguments its verified path accepts.
+ * only shows the arguments its verified path accepts, all required except
+ * customer_email (which the client fills in).
  */
 export function toListedSchema(tool, { hostedMode, verifiedAdminWrites, strippedArgs }) {
   const jsonSchema = z.toJSONSchema(tool.inputSchema);
@@ -108,10 +122,26 @@ export function toListedSchema(tool, { hostedMode, verifiedAdminWrites, stripped
       delete jsonSchema.properties[arg];
     }
   }
-  if (Array.isArray(jsonSchema.required)) {
+  if (verifiedAdminWrites && Array.isArray(tool.verifiedArgs)) {
+    jsonSchema.required = tool.verifiedArgs.filter(arg => arg !== 'customer_email' && jsonSchema.properties[arg]);
+  } else if (Array.isArray(jsonSchema.required)) {
     jsonSchema.required = jsonSchema.required.filter(keep);
   }
   return jsonSchema;
+}
+
+/**
+ * Customer-safe text for a verified call whose arguments fail the tool's
+ * schema (missing quantity, a non-numeric variant_id, an unknown interval
+ * unit). Names the fields only, never their values.
+ */
+export function verifiedSchemaRefusalMessage(zodError, tool, rawArgs) {
+  const missing = (tool.verifiedArgs || []).filter(arg => arg !== 'customer_email' && (rawArgs || {})[arg] === undefined);
+  const invalid = ((zodError && zodError.issues) || [])
+    .filter(issue => Array.isArray(issue.path) && issue.path.length > 0)
+    .map(issue => String(issue.path[0]));
+  const fields = [...new Set([...missing, ...invalid])];
+  return `The request was missing or had an invalid ${fields.join(', ') || 'argument'}, so no change was made.`;
 }
 
 export function listedDescription(tool, { verifiedAdminWrites, maxQuantity }) {

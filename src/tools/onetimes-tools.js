@@ -135,6 +135,8 @@ export const onetimeTools = [
       delete onetimeData.session_token;
       delete onetimeData.admin_token;
       delete onetimeData.store_url;
+      // address_id is only for the verified path; the legacy request is unchanged
+      delete onetimeData.address_id;
       const onetime = await client.createOnetime(onetimeData, args.customer_id, args.customer_email, args.session_token);
       
       return {

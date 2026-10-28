@@ -96,7 +96,23 @@ export const productTools = [
       }
 
       // Admin catalog read; caller tokens are stripped in hosted mode, so this uses the server's admin token
-      const result = await client.findAddableProducts(args.query);
+      let result;
+      try {
+        result = await client.findAddableProducts(args.query);
+      } catch (error) {
+        if (process.env.DEBUG === 'true') {
+          console.error(`[DEBUG] find_addable_product failed with status ${error.statusCode ?? 'unknown'}`);
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Products could not be looked up right now, so nothing can be added; hand off to a support agent.',
+            },
+          ],
+          isError: true,
+        };
+      }
       const text = result.products.length === 0
         ? `No product matching "${args.query}" can be added here; hand off to a support agent.`
         : `Addable Products:\n${JSON.stringify(result, null, 2)}`;

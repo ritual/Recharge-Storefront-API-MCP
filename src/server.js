@@ -29,6 +29,7 @@ import {
   parseMaxQuantity,
   toListedSchema,
   verifiedArgsRefusalMessage,
+  verifiedSchemaRefusalMessage,
 } from './utils/verified-writes.js';
 
 /**
@@ -213,6 +214,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const disallowed = findDisallowedVerifiedArgs(rawArgs, tool.verifiedArgs, HOSTED_STRIPPED_ARGS);
       if (disallowed.length > 0) {
         throw verifiedWriteRefusal(verifiedArgsRefusalMessage(tool, disallowed));
+      }
+    }
+    // Verified quantity and product tools refuse a schema failure in customer-safe text, not a raw Zod error
+    if (verifiedWrite && Array.isArray(tool.verifiedArgs)) {
+      const parsed = tool.inputSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw verifiedWriteRefusal(verifiedSchemaRefusalMessage(parsed.error, tool, rawArgs));
       }
     }
     const validatedArgs = tool.inputSchema.parse(rawArgs);

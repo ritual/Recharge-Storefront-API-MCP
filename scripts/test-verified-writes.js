@@ -21,6 +21,7 @@ import { tools } from '../src/tools/index.js';
 import {
   DEFAULT_VERIFIED_MAX_QUANTITY,
   findDisallowedVerifiedArgs,
+  isVerifiedWriteCall,
   parseAddableVariants,
   parseMaxQuantity,
 } from '../src/utils/verified-writes.js';
@@ -33,6 +34,8 @@ const HOSTED_STRIPPED_ARGS = ['customer_id', 'session_token', 'admin_token', 'st
 
 const FUTURE_1 = '2099-01-15';
 const FUTURE_2 = '2099-02-15';
+// The latest calendar date anywhere (UTC+14): a charge on it may already be processing somewhere
+const LATEST_TODAY = new Date(Date.now() + 14 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
 const toolByName = name => tools.find(tool => tool.name === name);
 
@@ -47,12 +50,12 @@ function fixtures() {
       {
         id: 1001, customer_id: 100, address_id: 501, status: 'active', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
-        external_variant_id: { ecommerce: '9001' }, price: '30.00',
+        external_variant_id: { ecommerce: '9001' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
       },
       {
         id: 1002, customer_id: 100, address_id: 501, status: 'cancelled', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 2, charge_interval_frequency: 2,
-        external_variant_id: { ecommerce: '9002' },
+        external_variant_id: { ecommerce: '9002' }, price: '30.00',
       },
       {
         id: 1003, customer_id: 100, address_id: 501, status: 'expired', quantity: 1, is_prepaid: false,
@@ -62,12 +65,24 @@ function fixtures() {
       {
         id: 1004, customer_id: 100, address_id: 501, status: 'active', quantity: 1, is_prepaid: true,
         order_interval_unit: 'week', order_interval_frequency: 4, charge_interval_frequency: 12,
-        external_variant_id: { ecommerce: '9004' },
+        external_variant_id: { ecommerce: '9004' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
+      },
+      {
+        // Same address, different schedule: next ships on FUTURE_2
+        id: 1005, customer_id: 100, address_id: 501, status: 'active', quantity: 1, is_prepaid: false,
+        order_interval_unit: 'week', order_interval_frequency: 2, charge_interval_frequency: 2,
+        external_variant_id: { ecommerce: '9005' }, price: '20.00', next_charge_scheduled_at: `${FUTURE_2}T00:00:00`,
       },
       {
         id: 2001, customer_id: 200, address_id: 601, status: 'active', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
-        external_variant_id: { ecommerce: '9001' },
+        external_variant_id: { ecommerce: '9001' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
+      },
+      {
+        // Someone else's active subscription returned for alice's address 502: must never count
+        id: 2002, customer_id: 200, address_id: 502, status: 'active', quantity: 1, is_prepaid: false,
+        order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
+        external_variant_id: { ecommerce: '9001' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
       },
     ],
     addresses: [
@@ -81,6 +96,9 @@ function fixtures() {
       { id: 3003, customer: { id: 100 }, address_id: 501, status: 'queued', scheduled_at: '2000-01-01' },
       // Returned by the list call but owned by someone else: must never count
       { id: 3004, customer: { id: 200 }, address_id: 501, status: 'queued', scheduled_at: '2099-03-01' },
+      // Due today somewhere in the world: may already be processing, so never joinable
+      { id: 3005, customer: { id: 100 }, address_id: 501, status: 'queued', scheduled_at: LATEST_TODAY },
+      { id: 3006, customer: { id: 100 }, address_id: 502, status: 'queued', scheduled_at: FUTURE_1 },
     ],
     products: {
       7001: {
@@ -102,9 +120,16 @@ function fixtures() {
         external_product_id: '7005', title: 'Protein Powder', published_at: '2020-01-01T00:00:00Z',
         variants: [{ external_variant_id: '8007', title: 'Chocolate', prices: { unit_price: '40.00' } }],
       },
+      7006: {
+        external_product_id: '7006', title: 'Free Sample', published_at: '2020-01-01T00:00:00Z',
+        variants: [{ external_variant_id: '8009', title: 'Default', prices: { unit_price: '0.00' } }],
+      },
     },
     plans: [
-      { id: 1, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: '7001' }, has_variant_restrictions: false },
+      {
+        id: 1, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: '7001' }, has_variant_restrictions: false,
+        subscription_preferences: { interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1 },
+      },
       // Product 7005: only a restricted plan for a different variant, plus a deleted one
       { id: 2, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: '7005' }, has_variant_restrictions: true, external_variant_ids: ['9999'] },
       { id: 3, type: 'subscription', deleted_at: '2024-01-01', external_product_id: { ecommerce: '7005' }, has_variant_restrictions: false },
@@ -115,11 +140,13 @@ function fixtures() {
 
 const ADDABLE = new Map([
   ['8001', '7001'], // sellable, subscribable
+  ['8006', '7001'], // second variant of the same product
   ['8003', '7002'], // unpublished
   ['8004', '7003'], // published in the future
   ['8005', '7404'], // product 404
   ['8008', '7001'], // variant missing from the product
   ['8007', '7005'], // sellable, no usable subscription plan
+  ['8009', '7006'], // published but priced 0.00
 ]);
 
 function notFound() {
@@ -130,9 +157,13 @@ function notFound() {
  * Build a client whose admin requests hit the in-memory store. `overrides`
  * maps "METHOD /path" to a handler that replaces the default one.
  */
+// A fresh store domain per client, so the per-process catalog cache never leaks between tests
+let clientCount = 0;
+
 function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQuantity = 2 } = {}) {
+  clientCount += 1;
   const client = new RechargeClient({
-    storeUrl: 'test-shop.myshopify.com',
+    storeUrl: `test-shop-${clientCount}.myshopify.com`,
     adminToken: FAKE_TOKEN,
     verifiedAdminWrites: true,
     verifiedMaxQuantity: maxQuantity,
@@ -172,10 +203,13 @@ function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQua
     'GET /plans': ({ params }) => ({
       plans: db.plans.filter(p => p.external_product_id.ecommerce === String(params.external_product_id)).map(p => structuredClone(p)),
     }),
+    // Deliberately ignores every filter: the client must filter by address itself
     'GET /onetimes': () => ({ onetimes: db.onetimes.map(o => structuredClone(o)) }),
     'PUT /subscriptions/:id': ({ id, data }) => ({ subscription: { ...structuredClone(byId(db.subscriptions, id)), ...data } }),
     'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, customer_id: 100, product_title: 'Essential for Women 18+', price: '33.00', ...data } }),
-    'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, customer_id: 100, status: 'active', price: '33.00', ...data } }),
+    'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, customer_id: 100, status: 'active', price: '29.70', ...data } }),
+    'DELETE /onetimes/:id': () => ({}),
+    'DELETE /subscriptions/:id': () => ({}),
     ...overrides,
   };
 
@@ -386,7 +420,7 @@ describe('verifiedCreateOnetime', () => {
     const db = fixtures();
     db.charges = db.charges.filter(charge => charge.customer.id !== 100 || charge.scheduled_at < '2001');
     const { client, calls } = makeClient({ db });
-    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /no upcoming order on address 501 to add to/);
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /no upcoming order on address 501 that can still be added to/);
     assert.equal(writes(calls).length, 0);
   });
 
@@ -463,7 +497,7 @@ describe('verifiedCreateSubscription', () => {
     const db = fixtures();
     db.subscriptions[0].order_day_of_month = 15;
     const { client, calls } = makeClient({ db });
-    await client.verifiedCreateSubscription(subscriptionArgs({ orderIntervalUnit: 'MONTH' }), EMAIL);
+    await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
     assert.deepEqual(writes(calls), [{
       method: 'POST',
       endpoint: '/subscriptions',
@@ -476,6 +510,7 @@ describe('verifiedCreateSubscription', () => {
         order_interval_unit: 'month',
         order_interval_frequency: 1,
         charge_interval_frequency: 1,
+        plan_id: 1,
         order_day_of_month: 15,
       },
       params: null,
@@ -496,9 +531,9 @@ describe('verifiedCreateSubscription', () => {
     assert.equal(writes(calls).length, 0);
   });
 
-  test('interval that matches no active subscription is refused', async () => {
+  test('interval that matches no subscription at all is refused', async () => {
     const { client, calls } = makeClient();
-    await refusal(client.verifiedCreateSubscription(subscriptionArgs({ orderIntervalFrequency: 2 }), EMAIL), /must match how often/);
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs({ orderIntervalFrequency: 3, orderIntervalUnit: 'day' }), EMAIL), /must match how often/);
     assert.equal(writes(calls).length, 0);
   });
 
@@ -549,7 +584,12 @@ describe('find_addable_product', () => {
   test('matches only allowlisted, published variants and reports can_subscribe', async () => {
     const { client, calls } = makeClient();
     const result = await client.findAddableProducts('essential women');
-    assert.deepEqual(result.products, [{ variant_id: '8001', title: 'Essential for Women 18+', variant_title: '30 count', unit_price: '33.00', can_subscribe: true }]);
+    // Both allowlisted variants of the product, with variant_id as the number the add tools take
+    assert.deepEqual(result.products, [
+      { variant_id: 8001, title: 'Essential for Women 18+', variant_title: '30 count', unit_price: '33.00', can_subscribe: true },
+      { variant_id: 8006, title: 'Essential for Women 18+', variant_title: '60 count', unit_price: '60.00', can_subscribe: true },
+    ]);
+    assert.deepEqual((await client.findAddableProducts('60 count')).products.map(product => product.variant_id), [8006]);
     const protein = await client.findAddableProducts('PROTEIN');
     assert.equal(protein.products[0].can_subscribe, false);
     assert.deepEqual((await client.findAddableProducts('unpublished')).products, []);
@@ -607,6 +647,279 @@ describe('logging', () => {
       assert.ok(!line.includes(EMAIL), `email in log: ${line}`);
       assert.ok(!line.includes(FAKE_TOKEN), `token in log: ${line}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: price guards, per-order cap, schedules, fail-closed reads
+// ---------------------------------------------------------------------------
+
+describe('quantity changes on free, gift and promotional lines', () => {
+  for (const [label, change] of [
+    ['priced 0.00', { price: '0.00' }],
+    ['with no price', { price: undefined }],
+    ['with a _gwp property', { properties: [{ name: '_gwp', value: 'true' }] }],
+    ['with a gift property', { properties: [{ name: 'Gift_Note', value: 'x' }] }],
+  ]) {
+    test(`a subscription ${label} is refused with no write`, async () => {
+      const db = fixtures();
+      Object.assign(db.subscriptions[0], change);
+      const { client, calls } = makeClient({ db });
+      await refusal(client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL), /gift or has a special price.*nothing was changed/);
+      assert.equal(writes(calls).length, 0);
+    });
+  }
+
+  test('ordinary properties do not block a quantity change', async () => {
+    const db = fixtures();
+    db.subscriptions[0].properties = [{ name: 'flavor', value: 'mint' }];
+    const { client, calls } = makeClient({ db });
+    await client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL);
+    assert.equal(writes(calls).length, 1);
+  });
+});
+
+describe('price guards on adds', () => {
+  test('an allowlisted variant priced 0.00 in the catalog cannot be added or found', async () => {
+    const { client, calls } = makeClient();
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId: 8009 }), EMAIL), /can't be added here/);
+    assert.deepEqual((await client.findAddableProducts('free sample')).products, []);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  for (const price of ['0.00', null, '99.00']) {
+    test(`a one-time Recharge prices at ${JSON.stringify(price)} is deleted again and refused`, async () => {
+      const { client, calls } = makeClient({
+        overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, customer_id: 100, ...data, price } }) },
+      });
+      await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /priced this item differently.*removed again and nothing was added/);
+      assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
+    });
+  }
+
+  test('a subscription priced above the catalog is deleted again and refused', async () => {
+    const { client, calls } = makeClient({
+      overrides: { 'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, ...data, price: '40.00' } }) },
+    });
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /removed again/);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /subscriptions', 'DELETE /subscriptions/1101']);
+  });
+
+  test('a discounted subscription price is accepted', async () => {
+    const { client, calls } = makeClient();
+    const result = await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
+    assert.equal(result.subscription.price, '29.70');
+    assert.equal(writes(calls).length, 1);
+  });
+
+  test('if the delete fails, the assistant is told not to retry', async () => {
+    const { client, calls } = makeClient({
+      overrides: {
+        'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '0.00' } }),
+        'DELETE /onetimes/:id': () => { throw new RechargeAPIError('boom', 500); },
+      },
+    });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /price that could not be confirmed. Do not retry/);
+    assert.equal(writes(calls).length, 2);
+  });
+
+  test('a record for another address is never deleted', async () => {
+    const { client, calls } = makeClient({
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, address_id: 999, price: '0.00' } }) },
+    });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /Do not retry/);
+    assert.deepEqual(writes(calls).map(call => call.method), ['POST']);
+  });
+});
+
+describe('quantity cap per order', () => {
+  test('a one-time add cannot push a product over the cap on an order', async () => {
+    const db = fixtures();
+    Object.assign(db.subscriptions[0], { external_variant_id: { ecommerce: '8001' }, quantity: 2 });
+    const { client, calls } = makeClient({ db });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /2099-01-15 order already has 2 of that product.*no more than 2/);
+    assert.equal(writes(calls).length, 0);
+    // The other order has none of it, so the same add is fine there
+    const second = makeClient({ db });
+    await second.client.verifiedCreateOnetime(onetimeArgs({ date: FUTURE_2 }), EMAIL);
+    assert.equal(writes(second.calls).length, 1);
+  });
+
+  test('raising a subscription counts one-time items of that product on its next order', async () => {
+    const db = fixtures();
+    db.onetimes.push({ id: 4000, address_id: 501, external_variant_id: { ecommerce: '9001' }, quantity: 1, next_charge_scheduled_at: FUTURE_1 });
+    const { client, calls } = makeClient({ db });
+    await refusal(client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL), /already has 1 of that product/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('lowering a subscription is never blocked by the per-order count', async () => {
+    const db = fixtures();
+    db.subscriptions[0].quantity = 2;
+    db.onetimes.push({ id: 4000, address_id: 501, external_variant_id: { ecommerce: '9001' }, quantity: 2, next_charge_scheduled_at: FUTURE_1 });
+    const { client, calls } = makeClient({ db });
+    await client.verifiedUpdateSubscriptionQuantity('1001', 1, EMAIL);
+    assert.equal(writes(calls).length, 1);
+  });
+
+  test('duplicate check needs no customer_id and no query filter, and reads by address only', async () => {
+    const db = fixtures();
+    db.onetimes.push({ id: 4000, address_id: 501, external_variant_id: { ecommerce: '8001' }, quantity: 1, next_charge_scheduled_at: FUTURE_1 });
+    // Another address's one-time for the same variant and date must not count
+    db.onetimes.push({ id: 4002, address_id: 502, external_variant_id: { ecommerce: '8001' }, quantity: 1, next_charge_scheduled_at: FUTURE_2 });
+    const { client, calls } = makeClient({ db });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /already on the 2099-01-15 order/);
+    assert.deepEqual(calls.find(call => call.endpoint === '/onetimes').params, { address_id: 501, limit: 250 });
+    const second = makeClient({ db });
+    await second.client.verifiedCreateOnetime(onetimeArgs({ date: FUTURE_2 }), EMAIL);
+    assert.equal(writes(second.calls).length, 1);
+  });
+
+  test('more than one page of one-time items fails closed', async () => {
+    const { client, calls } = makeClient({ overrides: { 'GET /onetimes': () => ({ onetimes: [], next_cursor: 'abc' }) } });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /too many one-time items.*nothing was changed/);
+    assert.equal(writes(calls).length, 0);
+  });
+});
+
+describe('dates and schedules', () => {
+  test('a charge due today anywhere is not joinable', async () => {
+    const { client, calls } = makeClient();
+    await assert.rejects(client.verifiedCreateOnetime(onetimeArgs({ date: LATEST_TODAY }), EMAIL), error => {
+      assert.match(error.message, new RegExp(`Upcoming order dates: ${FUTURE_1}, ${FUTURE_2}\\. `));
+      assert.match(error.message, /hand off to a support agent/);
+      return true;
+    });
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('a recurring add must start on the next order of the subscription whose interval it copies', async () => {
+    // Monthly interval (sub 1001, next FUTURE_1) on FUTURE_2, a queued date that belongs to sub 1005
+    const { client, calls } = makeClient();
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs({ date: FUTURE_2 }), EMAIL),
+      new RegExp(`must start on the next order of the subscription it ships with.*next ship on: ${FUTURE_1}\\.`));
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('the product must have a plan on the matched interval', async () => {
+    const db = fixtures();
+    db.plans[0].subscription_preferences = { interval_unit: 'month', order_interval_frequency: 2, charge_interval_frequency: 2 };
+    const { client, calls } = makeClient({ db });
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /isn't offered on the same schedule/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('the plan_id sent is the plan matching the interval', async () => {
+    const db = fixtures();
+    db.plans.unshift({
+      id: 9, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: '7001' }, has_variant_restrictions: false,
+      subscription_preferences: { interval_unit: 'week', order_interval_frequency: 2, charge_interval_frequency: 2 },
+    });
+    const { client, calls } = makeClient({ db });
+    await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
+    assert.equal(writes(calls)[0].data.plan_id, 1);
+  });
+
+  test("another customer's active subscription never makes an address addable", async () => {
+    const { client, calls } = makeClient();
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ addressId: '502' }), EMAIL), /has no active subscription/);
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs({ addressId: '502' }), EMAIL), /has no active subscription/);
+    assert.equal(writes(calls).length, 0);
+  });
+});
+
+describe('pre-write read failures', () => {
+  const failing = status => () => { throw new RechargeAPIError(`HTTP ${status} Error`, status); };
+  const cases = [
+    ['GET /plans 403 (missing read_plans)', 'GET /plans', 403, client => client.verifiedCreateSubscription(subscriptionArgs(), EMAIL)],
+    ['GET /products/:id 429', 'GET /products/:id', 429, client => client.verifiedCreateOnetime(onetimeArgs(), EMAIL)],
+    ['GET /charges 500', 'GET /charges', 500, client => client.verifiedCreateOnetime(onetimeArgs(), EMAIL)],
+    ['GET /onetimes 422', 'GET /onetimes', 422, client => client.verifiedCreateOnetime(onetimeArgs(), EMAIL)],
+    ['GET /subscriptions/:id 503', 'GET /subscriptions/:id', 503, client => client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL)],
+    ['GET /customers 500', 'GET /customers', 500, client => client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL)],
+  ];
+  for (const [label, route, status, run] of cases) {
+    test(`${label} is a hand-off refusal with no write`, async () => {
+      const { client, calls } = makeClient({ overrides: { [route]: failing(status) } });
+      await assert.rejects(run(client), error => {
+        assert.equal(error.message, 'This could not be checked right now, so nothing was changed. Do not ask the customer for account IDs or tokens; hand off to a support agent.');
+        return true;
+      });
+      assert.equal(writes(calls).length, 0);
+    });
+  }
+});
+
+describe('find_addable_product matching and load', () => {
+  test('whole words only: "men" never matches "women"', async () => {
+    const { client } = makeClient();
+    assert.deepEqual((await client.findAddableProducts('Essential for Men')).products, []);
+    assert.deepEqual((await client.findAddableProducts('men')).products, []);
+    assert.equal((await client.findAddableProducts('wom')).products.length, 2);
+    assert.equal((await client.findAddableProducts('18+')).products.length, 2);
+  });
+
+  test('catalog reads are cached between searches', async () => {
+    const { client, calls } = makeClient();
+    await client.findAddableProducts('essential');
+    const first = calls.filter(call => call.endpoint.startsWith('/products/')).length;
+    await client.findAddableProducts('protein');
+    assert.equal(calls.filter(call => call.endpoint.startsWith('/products/')).length, first);
+  });
+
+  test('a rate limit becomes a hand-off, not a raw API error', async () => {
+    const { client } = makeClient({ overrides: { 'GET /products/:id': () => { throw new RechargeAPIError('Too Many Requests', 429); } } });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /could not be looked up right now.*hand off to a support agent/);
+    assert.doesNotMatch(result.content[0].text, /API Error|429/);
+  });
+});
+
+describe('transitional mode and legacy create_onetime', () => {
+  const options = { verifiedTools: new Set(['skip_subscription', 'update_subscription', 'create_onetime', 'create_subscription']), verifiedAdminWrites: false, transitional: true };
+
+  test('purchase and quantity tools never take the verified path in transitional mode', () => {
+    for (const name of ['update_subscription', 'create_onetime', 'create_subscription']) {
+      assert.equal(isVerifiedWriteCall(name, { customer_email: EMAIL }, options), false, name);
+      assert.equal(isVerifiedWriteCall(name, { customer_email: EMAIL }, { ...options, verifiedAdminWrites: true }), true, name);
+    }
+    // Existing verified tools keep their transitional behaviour
+    assert.equal(isVerifiedWriteCall('skip_subscription', { customer_email: EMAIL }, options), true);
+    assert.equal(isVerifiedWriteCall('skip_subscription', { customer_email: EMAIL, session_token: 'x' }, options), false);
+  });
+
+  test('the legacy path never forwards address_id', async () => {
+    const { client } = makeClient();
+    client.verifiedAdminWrites = false;
+    let sent;
+    client.createOnetime = async data => { sent = data; return { onetime: { id: 1 } }; };
+    await toolByName('create_onetime').execute(client, { customer_email: EMAIL, address_id: '501', variant_id: 8001, quantity: 1, next_charge_scheduled_at: FUTURE_1 });
+    assert.deepEqual(sent, { variant_id: 8001, quantity: 1, next_charge_scheduled_at: FUTURE_1 });
+  });
+});
+
+describe('write-failure logging', () => {
+  test('the DEBUG line carries the Recharge message with emails removed', async () => {
+    const previousDebug = process.env.DEBUG;
+    const originalError = console.error;
+    const captured = [];
+    process.env.DEBUG = 'true';
+    console.error = (...args) => captured.push(args.join(' '));
+    try {
+      const { client } = makeClient({ overrides: { 'POST /onetimes': () => { throw new RechargeAPIError(`next_charge_scheduled_at is invalid for ${EMAIL}`, 422); } } });
+      await client.verifiedCreateOnetime(onetimeArgs(), EMAIL).catch(() => {});
+    } finally {
+      console.error = originalError;
+      if (previousDebug === undefined) {
+        delete process.env.DEBUG;
+      } else {
+        process.env.DEBUG = previousDebug;
+      }
+    }
+    const line = captured.find(item => item.includes('Verified write failed'));
+    assert.match(line, /status 422: next_charge_scheduled_at is invalid for <email>/);
+    assert.ok(captured.every(item => !item.includes(EMAIL)));
   });
 });
 
@@ -672,6 +985,11 @@ describe('server (stdio)', () => {
       const listed = await listTools(request);
       const byName = name => listed.find(tool => tool.name === name);
       assert.deepEqual(Object.keys(byName('update_subscription').inputSchema.properties).sort(), ['customer_email', 'quantity', 'subscription_id']);
+      // Everything the verified path needs is listed as required (customer_email is filled in by the client)
+      assert.deepEqual(byName('update_subscription').inputSchema.required, ['subscription_id', 'quantity']);
+      assert.deepEqual(byName('create_onetime').inputSchema.required, ['address_id', 'variant_id', 'quantity', 'next_charge_scheduled_at']);
+      assert.deepEqual(byName('create_subscription').inputSchema.required,
+        ['address_id', 'variant_id', 'quantity', 'next_charge_scheduled_at', 'order_interval_frequency', 'order_interval_unit']);
       assert.match(byName('update_subscription').description, /\(1-3\)/);
       assert.deepEqual(Object.keys(byName('create_onetime').inputSchema.properties).sort(),
         ['address_id', 'customer_email', 'next_charge_scheduled_at', 'quantity', 'variant_id']);
@@ -716,10 +1034,50 @@ describe('server (stdio)', () => {
         customer_email: EMAIL, address_id: '501', variant_id: 8001, quantity: 1, next_charge_scheduled_at: FUTURE_1, properties: [],
       });
       assert.match(props.content[0].text, /no change was made.*properties/);
+      const subscriptionArgsRaw = {
+        customer_email: EMAIL, address_id: '501', variant_id: 8001, quantity: 1, next_charge_scheduled_at: FUTURE_1,
+        order_interval_frequency: 1, order_interval_unit: 'month',
+      };
+      for (const extra of [{ price: 0.01 }, { properties: [{ name: '_gwp', value: 'true' }] }, { plan_id: 1 }]) {
+        const result = await callTool(request, 'create_subscription', { ...subscriptionArgsRaw, ...extra });
+        assert.equal(result.isError, true);
+        assert.match(result.content[0].text, new RegExp(`schedule matching an existing subscription can be set.*no change was made.*${Object.keys(extra)[0]}`));
+      }
       // Hosted-stripped args are ignored, not refused; the call then proceeds to the
       // (unreachable) API, so it fails with a network error rather than the allowlist refusal
       const stripped = await callTool(request, 'update_subscription', { customer_email: EMAIL, subscription_id: '1001', quantity: 2, session_token: 'x', customer_id: '200' });
       assert.doesNotMatch(stripped.content[0].text, /This request also asked to set/);
+    });
+  });
+
+  test('schema failures on verified calls are customer-safe refusals, not raw validation errors', async () => {
+    await withServer({ MCP_HOSTED_MODE: 'true' }, async ({ request }) => {
+      const cases = [
+        ['update_subscription', { customer_email: EMAIL, subscription_id: '1001' }, /missing or had an invalid quantity, so/],
+        ['create_onetime', { customer_email: EMAIL, address_id: '501', variant_id: '8001', quantity: 1, next_charge_scheduled_at: FUTURE_1 }, /invalid variant_id/],
+        ['create_subscription', {
+          customer_email: EMAIL, address_id: '501', variant_id: 8001, quantity: 1, next_charge_scheduled_at: FUTURE_1,
+          order_interval_frequency: 1, order_interval_unit: 'Month',
+        }, /invalid order_interval_unit/],
+      ];
+      for (const [name, args, pattern] of cases) {
+        const result = await callTool(request, name, args);
+        assert.equal(result.isError, true, name);
+        const text = result.content[0].text;
+        assert.match(text, pattern, name);
+        assert.match(text, /so no change was made.*hand off to a support agent/, name);
+        assert.doesNotMatch(text, /"code"|invalid_type|\[\s*\{/, name);
+      }
+    });
+  });
+
+  test('transitional mode never routes purchase or quantity tools to the verified path', async () => {
+    await withServer({ MCP_VERIFIED_ADMIN_WRITES: 'transitional' }, async ({ request }) => {
+      // On the legacy path the extra price argument is not refused by the verified allowlist
+      const result = await callTool(request, 'create_onetime', {
+        customer_email: EMAIL, address_id: '501', variant_id: 8001, quantity: 1, next_charge_scheduled_at: FUTURE_1, price: 0.01,
+      });
+      assert.doesNotMatch(result.content[0].text, /This request also asked to set/);
     });
   });
 

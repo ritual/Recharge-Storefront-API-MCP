@@ -207,7 +207,7 @@ export const subscriptionTools = [
       `Add a new recurring item (1-${maxQuantity} units) that ships on the same schedule as an existing active subscription at that address. ` +
       'Use find_addable_product for variant_id and get_subscriptions for that subscription; pass its order_interval_frequency, ' +
       'order_interval_unit and next_charge_scheduled_at. Ask the customer whether they want a one-time add or a recurring add; never pick for them. ' +
-      'Confirm the price as the catalog list price; the final charge is calculated by Recharge. ' +
+      'Confirm the price as the catalog list price (a subscription discount may lower it); the final charge is calculated by Recharge. ' +
       VERIFIED_PURCHASE_RULES,
     execute: async (client, args) => {
       if (client.verifiedAdminWrites) {
