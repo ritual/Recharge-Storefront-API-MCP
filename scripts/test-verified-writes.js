@@ -13,13 +13,14 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RechargeClient } from '../src/recharge-client.js';
 import { RechargeAPIError, handleAPIError } from '../src/utils/error-handler.js';
 import { createShopifyCatalog, parseShopifyCatalogConfig } from '../src/utils/shopify-catalog.js';
+import { ADDABLE_CATALOG_CACHE_TTL_MS, createAddableCatalogCache, parseCatalogCacheDir } from '../src/utils/catalog-cache.js';
 import { tools } from '../src/tools/index.js';
 import {
   DEFAULT_VERIFIED_MAX_QUANTITY,
@@ -190,26 +191,30 @@ const jsonResponse = (payload, status = 200) =>
   new Response(typeof payload === 'string' ? payload : JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
 
 /**
+ * The in-memory lookup_catalog answer for one request body.
+ */
+function lookupResponse(db, body) {
+  const { ids, context } = body.params.arguments.catalog;
+  const products = (db[context.address_country] || []).filter(product => product.variants.some(variant => ids.includes(variant.id)));
+  const returned = new Set(products.flatMap(product => product.variants.map(variant => variant.id)));
+  return jsonResponse(rpcResult(body.id, {
+    products: structuredClone(products),
+    messages: ids.filter(id => !returned.has(id)).map(id => ({ type: 'info', code: 'not_found', content: id })),
+  }));
+}
+
+/**
  * A real catalog client over a fake fetch. `respond(body, init)` replaces
  * the default in-memory lookup. Every request is kept on `.requests`.
  */
-function makeCatalog({ db = catalogFixtures(), respond = null, timeoutMs } = {}) {
+function makeCatalog({ db = catalogFixtures(), respond = null, timeoutMs, endpoint = UCP_URL, profileUrl = PROFILE_URL } = {}) {
   const requests = [];
   const fetchImpl = async (url, init) => {
     const body = JSON.parse(init.body);
     requests.push({ url, init, body });
-    if (respond) {
-      return respond(body, init);
-    }
-    const { ids, context } = body.params.arguments.catalog;
-    const products = (db[context.address_country] || []).filter(product => product.variants.some(variant => ids.includes(variant.id)));
-    const returned = new Set(products.flatMap(product => product.variants.map(variant => variant.id)));
-    return jsonResponse(rpcResult(body.id, {
-      products: structuredClone(products),
-      messages: ids.filter(id => !returned.has(id)).map(id => ({ type: 'info', code: 'not_found', content: id })),
-    }));
+    return respond ? respond(body, init) : lookupResponse(db, body);
   };
-  const catalog = createShopifyCatalog({ endpoint: UCP_URL, profileUrl: PROFILE_URL, fetchImpl, ...(timeoutMs ? { timeoutMs } : {}) });
+  const catalog = createShopifyCatalog({ endpoint, profileUrl, fetchImpl, ...(timeoutMs ? { timeoutMs } : {}) });
   catalog.requests = requests;
   return catalog;
 }
@@ -257,9 +262,12 @@ function notFound() {
  * maps "METHOD /path" to a handler that replaces the default one.
  */
 let clientCount = 0;
+// Default find_addable_product cache dirs live here, one per client, removed on exit
+const CACHE_ROOT = mkdtempSync(path.join(tmpdir(), 'recharge-mcp-cache-test-'));
+process.on('exit', () => rmSync(CACHE_ROOT, { recursive: true, force: true }));
 
-// A fresh catalog per client (default), so the find_addable_product cache never leaks between tests
-function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQuantity = 2, catalog = makeCatalog() } = {}) {
+// A fresh catalog and cache dir per client (default), so the find_addable_product cache never leaks between tests
+function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQuantity = 2, catalog = makeCatalog(), catalogCache } = {}) {
   clientCount += 1;
   const client = new RechargeClient({
     storeUrl: `test-shop-${clientCount}.myshopify.com`,
@@ -268,6 +276,9 @@ function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQua
     verifiedMaxQuantity: maxQuantity,
     addableVariants: addable,
     catalog,
+    catalogCache: catalogCache === undefined
+      ? createAddableCatalogCache({ dir: path.join(CACHE_ROOT, `client-${clientCount}`) })
+      : catalogCache,
   });
   const calls = [];
   const byId = (list, id) => list.find(item => String(item.id) === String(id));
@@ -1540,6 +1551,406 @@ describe('Recharge error messages', () => {
 });
 
 // ---------------------------------------------------------------------------
+// find_addable_product shared file cache (one file per endpoint, country and allowlist)
+// ---------------------------------------------------------------------------
+
+const T0 = Date.UTC(2026, 9, 1);
+const STORED_FIELDS = ['available', 'currency', 'productId', 'productTitle', 'unitPrice', 'variantId', 'variantTitle'];
+// 25 allowlisted IDs: three lookup_catalog chunks (10 + 10 + 5); the extras are unknown to the catalog
+const BIG_ADDABLE = new Map([...ADDABLE, ...Array.from({ length: 15 }, (_, index) => [String(8100 + index), '7001'])]);
+
+/**
+ * A cache dir that doesn't exist yet, inside a per-test temp dir removed after the test
+ */
+function tempCacheDir(t) {
+  const root = mkdtempSync(path.join(tmpdir(), 'recharge-mcp-cache-case-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return path.join(root, 'cache');
+}
+
+const cacheFiles = dir => (existsSync(dir) ? readdirSync(dir).sort() : []);
+const fileMode = file => statSync(file).mode & 0o777;
+
+describe('find_addable_product shared file cache', () => {
+  test('the TTL is 60 minutes and MCP_CATALOG_CACHE_DIR overrides the tmpdir default', () => {
+    assert.equal(ADDABLE_CATALOG_CACHE_TTL_MS, 60 * 60 * 1000);
+    assert.equal(parseCatalogCacheDir(undefined), path.join(tmpdir(), 'recharge-mcp-catalog-cache'));
+    assert.equal(parseCatalogCacheDir('   '), path.join(tmpdir(), 'recharge-mcp-catalog-cache'));
+    assert.equal(parseCatalogCacheDir(' /var/cache/mcp '), path.resolve('/var/cache/mcp'));
+  });
+
+  test('an entry written by one process is used by the next with no catalog call', async t => {
+    const dir = tempCacheDir(t);
+    const first = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+    const expected = {};
+    for (const query of ['essential', 'natalbiotic', 'protein']) {
+      expected[query] = (await first.client.findAddableProducts(query, EMAIL)).products;
+    }
+    assert.equal(first.catalog.requests.length, 1);
+    assert.equal(cacheFiles(dir).length, 1);
+    assert.match(cacheFiles(dir)[0], /^[0-9a-f]{64}\.json$/);
+
+    // A new client, catalog and cache object over the same dir: a new child process
+    const second = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+    for (const query of ['essential', 'natalbiotic', 'protein']) {
+      assert.deepEqual((await second.client.findAddableProducts(query, EMAIL)).products, expected[query], query);
+    }
+    assert.equal(second.catalog.requests.length, 0);
+  });
+
+  test('an entry is a hit up to 59:59 and a miss from 60:00', async t => {
+    const dir = tempCacheDir(t);
+    const clock = { now: T0 };
+    const now = () => clock.now;
+    await makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) }).client.findAddableProducts('essential', EMAIL);
+    const file = path.join(dir, cacheFiles(dir)[0]);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).storedAt, T0);
+
+    // Literal offsets, so this pins 60 minutes independently of the exported constant
+    for (const offset of [60 * 60 * 1000 - 1000, 60 * 60 * 1000 - 1]) {
+      clock.now = T0 + offset;
+      const reader = makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) });
+      assert.equal((await reader.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+      assert.equal(reader.catalog.requests.length, 0, `hit at +${offset}ms`);
+    }
+
+    clock.now = T0 + 60 * 60 * 1000;
+    const expired = makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) });
+    assert.equal((await expired.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal(expired.catalog.requests.length, 1);
+    // The fresh lookup replaced the entry
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).storedAt, T0 + 60 * 60 * 1000);
+  });
+
+  test('the in-memory layer expires with the same TTL', async t => {
+    const clock = { now: T0 };
+    const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir: tempCacheDir(t), now: () => clock.now }) });
+    await client.findAddableProducts('essential', EMAIL);
+    clock.now = T0 + ADDABLE_CATALOG_CACHE_TTL_MS - 1000;
+    await client.findAddableProducts('essential', EMAIL);
+    assert.equal(catalog.requests.length, 1);
+    clock.now = T0 + ADDABLE_CATALOG_CACHE_TTL_MS;
+    await client.findAddableProducts('essential', EMAIL);
+    assert.equal(catalog.requests.length, 2);
+  });
+
+  test('country, allowlist (variant or product), endpoint and agent profile each get their own entry', async t => {
+    const dir = tempCacheDir(t);
+    const cache = () => createAddableCatalogCache({ dir });
+    const remapped = new Map(ADDABLE);
+    remapped.set('8001', '7999');
+    const cases = [
+      ['US', {}],
+      ['CA', { db: withCountry('CA') }],
+      ['fewer variants', { addable: new Map([...ADDABLE].slice(0, 5)) }],
+      ['another product ID', { addable: remapped }],
+      ['another endpoint', { catalog: makeCatalog({ endpoint: 'https://other.example.com/api/ucp/mcp' }) }],
+      ['another agent profile', { catalog: makeCatalog({ profileUrl: 'https://mcp.example.com/ucp/other-profile.json' }) }],
+    ];
+    for (const [index, [label, options]] of cases.entries()) {
+      const { client, catalog } = makeClient({ ...options, catalogCache: cache() });
+      await client.findAddableProducts('essential', EMAIL);
+      assert.equal(catalog.requests.length, 1, label);
+      assert.equal(cacheFiles(dir).length, index + 1, label);
+    }
+    // Every entry is still there for its own scope (a new catalog object with the same endpoint and profile)
+    const sameCatalog = catalog => makeCatalog({ endpoint: catalog.endpoint, profileUrl: catalog.profileUrl });
+    for (const [label, options] of cases) {
+      const fresh = { ...options, ...(options.catalog ? { catalog: sameCatalog(options.catalog) } : {}) };
+      const { client, catalog } = makeClient({ ...fresh, catalogCache: cache() });
+      await client.findAddableProducts('essential', EMAIL);
+      assert.equal(catalog.requests.length, 0, label);
+    }
+    // The key uses the sorted allowlist: the same pairs in another order are the same entry
+    const reordered = makeClient({ addable: new Map([...ADDABLE].reverse()), catalogCache: cache() });
+    await reordered.client.findAddableProducts('essential', EMAIL);
+    assert.equal(reordered.catalog.requests.length, 0);
+    assert.equal(cacheFiles(dir).length, cases.length);
+  });
+
+  test('a corrupt, wrong-version, future, mis-scoped or mistyped entry is a miss and is overwritten', async t => {
+    const dir = tempCacheDir(t);
+    const seeded = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+    const expected = (await seeded.client.findAddableProducts('essential', EMAIL)).products;
+    const file = path.join(dir, cacheFiles(dir)[0]);
+    const good = JSON.parse(readFileSync(file, 'utf8'));
+    const withVariant = (field, value) => ({
+      ...good,
+      variants: good.variants.map((variant, index) => (index === 0 ? { ...variant, [field]: value } : variant)),
+    });
+    const without = field => ({ ...good, variants: good.variants.map(({ [field]: _dropped, ...rest }) => rest) });
+
+    const cases = {
+      'truncated JSON': '{"version":1,"storedAt":',
+      'not JSON': 'hello',
+      'null': 'null',
+      'an array': '[]',
+      'wrong version': { ...good, version: 2 },
+      'no version': { ...good, version: undefined },
+      'future storedAt': { ...good, storedAt: Date.now() + 60 * 1000 },
+      'storedAt as a string': { ...good, storedAt: String(good.storedAt) },
+      'fractional storedAt': { ...good, storedAt: good.storedAt + 0.5 },
+      'another country': { ...good, country: 'CA' },
+      'variants not an array': { ...good, variants: {} },
+      'variant not an object': { ...good, variants: [...good.variants.slice(1), 'x'] },
+      'variantId not allowlisted': withVariant('variantId', '123'),
+      'variantId as a number': withVariant('variantId', 8001),
+      'duplicate variantId': { ...good, variants: [...good.variants, good.variants[0]] },
+      'productId as a number': withVariant('productId', 7001),
+      'productId not digits': withVariant('productId', 'gid://shopify/Product/7001'),
+      'productTitle as a number': withVariant('productTitle', 1),
+      'variantTitle missing': without('variantTitle'),
+      'unitPrice as a string': withVariant('unitPrice', '33.00'),
+      'unitPrice negative': withVariant('unitPrice', -1),
+      'unitPrice finer than the currency': withVariant('unitPrice', 33.005),
+      'currency missing': without('currency'),
+      'currency not an ISO 4217 code': withVariant('currency', 'USDX'),
+      'currency lowercase': withVariant('currency', 'usd'),
+      'currency empty with a price': withVariant('currency', ''),
+      'available as a string': withVariant('available', 'true'),
+    };
+    for (const [label, entry] of Object.entries(cases)) {
+      writeFileSync(file, typeof entry === 'string' ? entry : JSON.stringify(entry));
+      const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+      assert.deepEqual((await client.findAddableProducts('essential', EMAIL)).products, expected, label);
+      assert.equal(catalog.requests.length, 1, label);
+      const rewritten = JSON.parse(readFileSync(file, 'utf8'));
+      assert.equal(rewritten.version, 1, label);
+      assert.deepEqual(rewritten.variants, good.variants, label);
+      assert.deepEqual(cacheFiles(dir), [path.basename(file)], label);
+    }
+  });
+
+  test('a failing chunk fails the search and nothing is cached', async t => {
+    const dir = tempCacheDir(t);
+    const failing = body => (body.params.arguments.catalog.ids.includes(variantGid('8112'))
+      ? new Response('nope', { status: 500 })
+      : lookupResponse(catalogFixtures(), body));
+    const { client, catalog } = makeClient({ addable: BIG_ADDABLE, catalog: makeCatalog({ respond: failing }), catalogCache: createAddableCatalogCache({ dir }) });
+    await assert.rejects(client.findAddableProducts('essential', EMAIL));
+    assert.equal(catalog.requests.length, 3);
+    assert.deepEqual(cacheFiles(dir), []);
+
+    // The next search reads the catalog again (no error or partial result was kept)
+    const next = makeClient({ addable: BIG_ADDABLE, catalogCache: createAddableCatalogCache({ dir }) });
+    assert.equal((await next.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal(next.catalog.requests.length, 3);
+    assert.equal(cacheFiles(dir).length, 1);
+  });
+
+  test('an unusable cache dir still returns a fresh result', async t => {
+    const root = path.dirname(tempCacheDir(t));
+    const blocker = path.join(root, 'a-file');
+    writeFileSync(blocker, 'x');
+    const dirs = [blocker, path.join(blocker, 'cache')];
+    const canDenyWrites = process.platform !== 'win32' && !(typeof process.getuid === 'function' && process.getuid() === 0);
+    if (canDenyWrites) {
+      const readOnly = path.join(root, 'read-only');
+      mkdirSync(readOnly, { mode: 0o700 });
+      chmodSync(readOnly, 0o500);
+      dirs.push(readOnly);
+    }
+    try {
+      for (const dir of dirs) {
+        for (let run = 0; run < 2; run += 1) {
+          const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+          const { products } = await client.findAddableProducts('essential', EMAIL);
+          assert.deepEqual(products.map(product => product.variant_id), [8001, 8006], dir);
+          assert.equal(catalog.requests.length, 1, dir);
+        }
+      }
+      if (canDenyWrites) {
+        assert.deepEqual(cacheFiles(path.join(root, 'read-only')), []);
+      }
+    } finally {
+      if (canDenyWrites) {
+        chmodSync(path.join(root, 'read-only'), 0o700);
+      }
+    }
+  });
+
+  test('create_onetime and create_subscription never read or write the cache', async t => {
+    const dir = tempCacheDir(t);
+    await makeClient({ catalogCache: createAddableCatalogCache({ dir }) }).client.findAddableProducts('essential', EMAIL);
+    const file = path.join(dir, cacheFiles(dir)[0]);
+    const before = readFileSync(file, 'utf8');
+
+    const real = createAddableCatalogCache({ dir });
+    const used = [];
+    const spy = {
+      get: scope => { used.push('get'); return real.get(scope); },
+      set: (scope, variants) => { used.push('set'); return real.set(scope, variants); },
+    };
+    const { client, catalog } = makeClient({ catalogCache: spy });
+    await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
+    await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
+    // Both read the one variant fresh, although a valid entry covers it
+    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.ids), [[variantGid('8001')], [variantGid('8001')]]);
+    assert.deepEqual(used, []);
+    assert.equal(readFileSync(file, 'utf8'), before);
+
+    // The entry was valid all along: a search on the same client uses it
+    await client.findAddableProducts('essential', EMAIL);
+    assert.equal(catalog.requests.length, 2);
+    assert.deepEqual(used, ['get']);
+
+    // With an empty cache dir, adds create nothing there
+    const emptyDir = tempCacheDir(t);
+    const fresh = makeClient({ catalogCache: createAddableCatalogCache({ dir: emptyDir }) });
+    await fresh.client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
+    await fresh.client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
+    assert.equal(fresh.catalog.requests.length, 2);
+    assert.equal(existsSync(emptyDir), false);
+  });
+
+  test('entries hold only the find fields (no descriptions), in a 0700 dir as 0600 files', async t => {
+    const dir = path.join(tempCacheDir(t), 'nested');
+    const { client } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+    await client.findAddableProducts('essential', EMAIL);
+    const [name] = cacheFiles(dir);
+    const text = readFileSync(path.join(dir, name), 'utf8');
+    assert.ok(!text.includes(DESCRIPTION_MARKER));
+    assert.doesNotMatch(text, /description|html|handle|sku|<p>/i);
+    const entry = JSON.parse(text);
+    assert.deepEqual(Object.keys(entry).sort(), ['country', 'storedAt', 'variants', 'version']);
+    assert.ok(entry.variants.length > 0);
+    for (const variant of entry.variants) {
+      assert.deepEqual(Object.keys(variant).sort(), STORED_FIELDS);
+    }
+    if (process.platform !== 'win32') {
+      assert.equal(fileMode(dir), 0o700);
+      assert.equal(fileMode(path.join(dir, name)), 0o600);
+    }
+  });
+
+  test('an existing cache dir that is not private is left untouched and not used', { skip: process.platform === 'win32' }, async t => {
+    // e.g. MCP_CATALOG_CACHE_DIR=/tmp: never chmod a directory the cache didn't create
+    for (const mode of [0o755, 0o1777, 0o2770]) {
+      const dir = tempCacheDir(t);
+      mkdirSync(dir);
+      chmodSync(dir, mode);
+      for (let run = 0; run < 2; run += 1) {
+        const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+        assert.equal((await client.findAddableProducts('essential', EMAIL)).products.length, 2);
+        assert.equal(catalog.requests.length, 1, mode.toString(8));
+      }
+      assert.equal(statSync(dir).mode & 0o7777, mode);
+      assert.deepEqual(cacheFiles(dir), []);
+    }
+  });
+
+  test('an empty successful lookup is not cached', async t => {
+    const dir = tempCacheDir(t);
+    // Every chunk succeeds but the catalog returns nothing (e.g. a brief unpublish or a catalog blip)
+    const empty = makeClient({ catalog: makeCatalog({ db: {} }), catalogCache: createAddableCatalogCache({ dir }) });
+    assert.deepEqual((await empty.client.findAddableProducts('essential', EMAIL)).products, []);
+    assert.equal(empty.catalog.requests.length, 1);
+    assert.deepEqual(cacheFiles(dir), []);
+    // The next search (same process or another) reads the catalog again
+    await empty.client.findAddableProducts('essential', EMAIL);
+    assert.equal(empty.catalog.requests.length, 2);
+    const next = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+    assert.equal((await next.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal(next.catalog.requests.length, 1);
+    assert.equal(cacheFiles(dir).length, 1);
+  });
+
+  test('an unreadable price and an unmatched product ID round-trip as a hit and stay unsellable', async t => {
+    const dir = tempCacheDir(t);
+    const db = catalogFixtures();
+    // 8001: price not in minor units; 8006: moved to a product whose ID isn't a Product GID
+    db.US[0].variants[0].price.amount = '33.00';
+    db.US.push({ ...ucpProduct('7001', 'Essential for Women 18+', 'essential-2', [db.US[0].variants.pop()]), id: 'Product/7001' });
+    const first = makeClient({ catalog: makeCatalog({ db }), catalogCache: createAddableCatalogCache({ dir }) });
+    assert.deepEqual((await first.client.findAddableProducts('essential', EMAIL)).products, []);
+    const stored = JSON.parse(readFileSync(path.join(dir, cacheFiles(dir)[0]), 'utf8')).variants;
+    assert.equal(stored.find(variant => variant.variantId === '8001').unitPrice, null);
+    assert.equal(stored.find(variant => variant.variantId === '8006').productId, null);
+
+    const second = makeClient({ catalog: makeCatalog({ db }), catalogCache: createAddableCatalogCache({ dir }) });
+    assert.deepEqual((await second.client.findAddableProducts('essential', EMAIL)).products, []);
+    assert.deepEqual((await second.client.findAddableProducts('natalbiotic', EMAIL)).products.map(product => product.variant_id), [42144416137310]);
+    assert.equal(second.catalog.requests.length, 0);
+  });
+
+  test('entries are written atomically: a temp file renamed over the entry, never written through', { skip: process.platform === 'win32' }, async t => {
+    const dir = tempCacheDir(t);
+    await makeClient({ catalogCache: createAddableCatalogCache({ dir }) }).client.findAddableProducts('essential', EMAIL);
+    const [name] = cacheFiles(dir);
+    const file = path.join(dir, name);
+    const good = readFileSync(file, 'utf8');
+
+    // A symlink at the entry path is replaced, its target never written
+    const victim = path.join(path.dirname(dir), 'victim.txt');
+    writeFileSync(victim, 'original');
+    rmSync(file);
+    symlinkSync(victim, file);
+    const relinked = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+    assert.equal((await relinked.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal(relinked.catalog.requests.length, 1);
+    assert.equal(readFileSync(victim, 'utf8'), 'original');
+    assert.ok(lstatSync(file).isFile());
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).variants, JSON.parse(good).variants);
+    assert.deepEqual(cacheFiles(dir), [name]);
+
+    // A rename that fails (a directory at the entry path) leaves no temp file behind
+    rmSync(file);
+    mkdirSync(file);
+    writeFileSync(path.join(file, 'keep'), 'x');
+    for (let run = 0; run < 2; run += 1) {
+      const blocked = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
+      assert.equal((await blocked.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+      assert.equal(blocked.catalog.requests.length, 1);
+      assert.deepEqual(cacheFiles(dir), [name]);
+    }
+  });
+
+  test('lookup chunks are all requested before any response arrives', async () => {
+    const release = [];
+    const db = catalogFixtures();
+    // Variants in the second and third chunks, and one returned under two products
+    db.US.push(ucpProduct('7100', 'Extra', 'extra', [ucpVariant('8100', 'A', 100, 'USD'), ucpVariant('8113', 'C', 100, 'USD')]));
+    db.US.push(ucpProduct('7101', 'Extra Two', 'extra-two', [ucpVariant('8110', 'B', 100, 'USD'), ucpVariant('8113', 'C', 100, 'USD')]));
+    const catalog = makeCatalog({
+      respond: body => new Promise(resolve => release.push(() => resolve(lookupResponse(db, body)))),
+    });
+    const pending = catalog.lookupVariants([...BIG_ADDABLE.keys()], 'US');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(catalog.requests.length, 3);
+    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.ids.length), [10, 10, 5]);
+    // Release in reverse order: the merge still follows chunk order
+    for (const resolve of release.reverse()) {
+      resolve();
+    }
+    const found = await pending;
+    assert.deepEqual([...found.keys()], ['8001', '8006', '8004', '8007', '8009', '8010', NATALBIOTIC.variantId, '8100', '8110']);
+    // One variant under two products is still dropped as ambiguous
+    assert.equal(found.has('8113'), false);
+  });
+
+  test('a chunk that fails while the others are pending fails the search and nothing is cached', async t => {
+    const dir = tempCacheDir(t);
+    const release = [];
+    const respond = body => (body.params.arguments.catalog.ids.includes(variantGid('8112'))
+      ? new Response('nope', { status: 500 })
+      : new Promise(resolve => release.push(() => resolve(lookupResponse(catalogFixtures(), body)))));
+    const { client, catalog } = makeClient({ addable: BIG_ADDABLE, catalog: makeCatalog({ respond }), catalogCache: createAddableCatalogCache({ dir }) });
+    try {
+      await assert.rejects(client.findAddableProducts('essential', EMAIL));
+      assert.equal(catalog.requests.length, 3);
+      assert.equal(release.length, 2);
+      assert.deepEqual(cacheFiles(dir), []);
+    } finally {
+      for (const resolve of release) {
+        resolve();
+      }
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(cacheFiles(dir), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Server: listing and raw-argument refusal over stdio (no network)
 // ---------------------------------------------------------------------------
 
@@ -1553,6 +1964,7 @@ async function withServer(env, fn) {
       RECHARGE_ADMIN_TOKEN: FAKE_TOKEN,
       // Unreachable: any request that slips through fails instead of leaving the machine
       RECHARGE_API_URL: 'https://127.0.0.1:9',
+      MCP_CATALOG_CACHE_DIR: path.join(cwd, 'catalog-cache'),
       ...env,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -1567,7 +1979,8 @@ async function withServer(env, fn) {
     while ((index = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, index).trim();
       buffer = buffer.slice(index + 1);
-      if (!line) continue;
+      // dotenv's own debug lines (DEBUG=true) also go to stdout: skip anything that isn't a JSON object
+      if (!line.startsWith('{')) continue;
       const message = JSON.parse(line);
       if (pending.has(message.id)) {
         pending.get(message.id)(message);
@@ -1717,6 +2130,37 @@ describe('server (stdio)', () => {
       assert.match(result.content[0].text, /Products could not be looked up right now, so nothing can be added; hand off to a support agent/);
       assert.doesNotMatch(result.content[0].text, /Adding products isn't available here/);
       assert.doesNotMatch(stderr(), /MCP_SHOPIFY_UCP_URL|MCP_UCP_AGENT_PROFILE|adding products is disabled/);
+    });
+  });
+
+  test('find_addable_product reads the MCP_CATALOG_CACHE_DIR entry in every server process', async t => {
+    // Seed the entry another process would have written; the catalog itself is unreachable here
+    const dir = tempCacheDir(t);
+    const endpoint = 'https://127.0.0.1:9/api/ucp/mcp';
+    const seed = createShopifyCatalog({ endpoint, profileUrl: PROFILE_URL, fetchImpl: async () => { throw new Error('no network'); } });
+    await createAddableCatalogCache({ dir }).set(
+      { endpoint: seed.endpoint, profileUrl: seed.profileUrl, country: 'US', addable: new Map([['8001', '7001']]) },
+      new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: '30 count', unitPrice: 33, currency: 'USD', available: true }]]),
+    );
+    assert.equal(cacheFiles(dir).length, 1);
+    const env = { MCP_VERIFIED_ADDABLE_VARIANTS: '7001:8001', MCP_SHOPIFY_UCP_URL: endpoint, MCP_UCP_AGENT_PROFILE: PROFILE_URL };
+    // Two separate processes (as behind a stateless gateway): both answer from the entry, no email so no Recharge read
+    for (const debugEnv of [{ DEBUG: 'true' }, {}]) {
+      await withServer({ ...env, ...debugEnv, MCP_CATALOG_CACHE_DIR: dir }, async ({ request, stderr }) => {
+        const result = await callTool(request, 'find_addable_product', { query: 'essential' });
+        assert.ok(!result.isError, result.content[0].text);
+        assert.match(result.content[0].text, /Addable Products/);
+        assert.match(result.content[0].text, /"variant_id": 8001/);
+        assert.match(result.content[0].text, /"unit_price": "33.00"/);
+        if (debugEnv.DEBUG) {
+          assert.ok(stderr().includes(`find_addable_product catalog cache: ${dir}`), stderr());
+        }
+      });
+    }
+    // Another (empty) MCP_CATALOG_CACHE_DIR: the unreachable catalog is read, so a hand-off
+    await withServer({ ...env, MCP_CATALOG_CACHE_DIR: tempCacheDir(t) }, async ({ request }) => {
+      const result = await callTool(request, 'find_addable_product', { query: 'essential' });
+      assert.match(result.content[0].text, /Products could not be looked up right now/);
     });
   });
 

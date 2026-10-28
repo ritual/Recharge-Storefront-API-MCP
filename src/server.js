@@ -32,6 +32,7 @@ import {
   verifiedSchemaRefusalMessage,
 } from './utils/verified-writes.js';
 import { createShopifyCatalog, parseShopifyCatalogConfig } from './utils/shopify-catalog.js';
+import { createAddableCatalogCache, parseCatalogCacheDir } from './utils/catalog-cache.js';
 
 /**
  * Server statistics tracking
@@ -109,6 +110,15 @@ const shopifyCatalog = shopifyCatalogConfig.config ? createShopifyCatalog(shopif
 if (!shopifyCatalog && shopifyCatalogConfig.warnings.length === 0 && addableVariants.variants.size > 0) {
   shopifyCatalogConfig.warnings.push('MCP_VERIFIED_ADDABLE_VARIANTS is set but MCP_SHOPIFY_UCP_URL and MCP_UCP_AGENT_PROFILE are not; adding products is disabled');
 }
+
+/**
+ * find_addable_product's catalog read is cached for 60 minutes in files under
+ * MCP_CATALOG_CACHE_DIR (default <os tmpdir>/recharge-mcp-catalog-cache), so
+ * the per-request child processes of a stateless HTTP gateway share it.
+ * create_onetime and create_subscription always read the catalog fresh.
+ */
+const catalogCacheDir = parseCatalogCacheDir(process.env.MCP_CATALOG_CACHE_DIR);
+const addableCatalogCache = shopifyCatalog ? createAddableCatalogCache({ dir: catalogCacheDir }) : null;
 
 /**
  * Tools hidden from listing and rejected on call (comma-separated names)
@@ -324,6 +334,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       verifiedMaxQuantity: verifiedMaxQuantity.value,
       addableVariants: addableVariants.variants,
       catalog: shopifyCatalog,
+      catalogCache: addableCatalogCache,
     });
     
     // Track customer for statistics
@@ -484,6 +495,7 @@ async function main() {
       console.error('[DEBUG] Verified admin writes:', verifiedAdminWrites ? 'Enabled' : (verifiedAdminWritesTransitional ? 'Transitional' : 'Disabled'));
       console.error('[DEBUG] Verified max quantity:', verifiedMaxQuantity.value, '- addable variants:', addableVariants.variants.size);
       console.error('[DEBUG] Shopify catalog for adds:', shopifyCatalog ? 'Configured' : 'Not configured');
+      console.error('[DEBUG] find_addable_product catalog cache:', addableCatalogCache ? addableCatalogCache.dir : 'Not configured');
       console.error('[DEBUG] Session token:', (process.env.RECHARGE_SESSION_TOKEN && process.env.RECHARGE_SESSION_TOKEN.trim() !== '') ? 'Configured' : 'Not configured');
       console.error('[INFO] Server ready - listening for MCP requests');
     }

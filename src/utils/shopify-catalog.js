@@ -215,12 +215,17 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
       throw catalogError('Catalog lookup variant IDs must be digits', { code: 'invalid_id' });
     }
 
+    // Chunks are looked up in parallel; any failed chunk fails the whole lookup
+    const chunks = [];
+    for (let start = 0; start < ids.length; start += CATALOG_LOOKUP_CHUNK) {
+      chunks.push(new Set(ids.slice(start, start + CATALOG_LOOKUP_CHUNK).map(id => `${VARIANT_GID}${id}`)));
+    }
+    const responses = await Promise.all(chunks.map(requested => call([...requested], country)));
+
     const found = new Map();
     const conflicting = new Set();
-    for (let start = 0; start < ids.length; start += CATALOG_LOOKUP_CHUNK) {
-      const chunk = ids.slice(start, start + CATALOG_LOOKUP_CHUNK);
-      const requested = new Set(chunk.map(id => `${VARIANT_GID}${id}`));
-      for (const product of await call([...requested], country)) {
+    for (const [index, requested] of chunks.entries()) {
+      for (const product of responses[index]) {
         const productMatch = PRODUCT_GID.exec(String((product && product.id) || ''));
         for (const variant of (product && Array.isArray(product.variants) ? product.variants : [])) {
           const gid = String((variant && variant.id) || '');
@@ -259,5 +264,6 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
     return found;
   }
 
-  return { lookupVariants };
+  // The endpoint and agent profile are part of the find_addable_product cache key
+  return { endpoint: httpsUrl(endpoint), profileUrl: httpsUrl(profileUrl), lookupVariants };
 }

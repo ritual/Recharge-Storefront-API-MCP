@@ -19,10 +19,6 @@ const VERIFIED_HANDOFF = 'hand off to a support agent';
 const VERIFIED_INTERVAL_UNITS = ['day', 'week', 'month'];
 // Subscription line properties that mark a gift or promotional line (e.g. _gwp)
 const VERIFIED_GIFT_PROPERTY = /^_*(gwp|gift|free|promo)/i;
-// find_addable_product caches catalog reads per process; write-time checks always read fresh
-const ADDABLE_PRODUCT_CACHE_TTL_MS = 60 * 1000;
-// Per catalog instance: "country:variantIds" -> { at, variants }
-const addableProductCache = new WeakMap();
 // Catalog country when a customer's addresses don't share one (or no customer is given)
 const DEFAULT_CATALOG_COUNTRY = 'US';
 // The store's base currency: a created record that names no currency is only trusted against this
@@ -108,6 +104,7 @@ export class RechargeClient {
     verifiedMaxQuantity = DEFAULT_VERIFIED_MAX_QUANTITY,
     addableVariants = new Map(),
     catalog = null,
+    catalogCache = null,
   }) {
     if (!storeUrl) {
       throw new Error('Store URL is required');
@@ -157,6 +154,8 @@ export class RechargeClient {
     this.addableVariants = addableVariants instanceof Map ? addableVariants : new Map();
     // Shopify storefront catalog (src/utils/shopify-catalog.js); without it nothing can be added
     this.catalog = catalog && typeof catalog.lookupVariants === 'function' ? catalog : null;
+    // Shared file cache for find_addable_product only (src/utils/catalog-cache.js); write-time checks never use it
+    this.catalogCache = catalogCache && typeof catalogCache.get === 'function' && typeof catalogCache.set === 'function' ? catalogCache : null;
     this.sessionCache = new SessionCache();
     this.currentDomain = domain; // Store current domain for cache management
 
@@ -2025,24 +2024,27 @@ export class RechargeClient {
   }
 
   /**
-   * Every allowlisted variant from the catalog for a country, cached per
-   * process for a short time so a search doesn't re-read the catalog.
-   * Write-time checks never use this cache.
+   * Every allowlisted variant from the catalog for a country, from the shared
+   * file cache (60 minutes, keyed by endpoint, agent profile, country and
+   * allowlist) when it has a valid entry. Only a lookup where every chunk
+   * succeeded and returned at least one variant is cached. Write-time checks
+   * never use this cache.
    */
   async getCachedAddableCatalog(country) {
     const ids = [...this.addableVariants.keys()].sort();
-    const key = `${country}:${ids.join(',')}`;
-    let byKey = addableProductCache.get(this.catalog);
-    if (!byKey) {
-      byKey = new Map();
-      addableProductCache.set(this.catalog, byKey);
+    const { endpoint, profileUrl } = this.catalog;
+    const cache = this.catalogCache && typeof endpoint === 'string' && typeof profileUrl === 'string' ? this.catalogCache : null;
+    const scope = { endpoint, profileUrl, country, addable: this.addableVariants };
+    const cached = cache ? await cache.get(scope) : null;
+    if (cached) {
+      return cached;
     }
-    const cached = byKey.get(key);
-    if (cached && Date.now() - cached.at < ADDABLE_PRODUCT_CACHE_TTL_MS) {
-      return cached.variants;
-    }
+    // A failed lookup throws here, so errors and partial results are never cached;
+    // nor is an empty one (a catalog blip would otherwise hide everything for an hour)
     const variants = await this.catalog.lookupVariants(ids, country);
-    byKey.set(key, { at: Date.now(), variants });
+    if (cache && variants.size > 0) {
+      await cache.set(scope, variants);
+    }
     return variants;
   }
 
