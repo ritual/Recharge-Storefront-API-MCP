@@ -1117,11 +1117,11 @@ describe('catalog client', () => {
     assert.equal((await catalog.lookupVariants(['8001'], 'US')).size, 0);
   });
 
-  test('more than 50 IDs are split into chunks', async () => {
+  test('more than 10 IDs are split into chunks of 10 (the lookup_catalog limit)', async () => {
     const catalog = makeCatalog();
-    const ids = Array.from({ length: 120 }, (_, index) => String(10000 + index));
+    const ids = Array.from({ length: 24 }, (_, index) => String(10000 + index));
     await catalog.lookupVariants(ids, 'US');
-    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.ids.length), [50, 50, 20]);
+    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.ids.length), [10, 10, 4]);
   });
 
   const failures = [

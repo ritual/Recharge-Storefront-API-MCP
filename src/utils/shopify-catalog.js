@@ -12,7 +12,8 @@
  * or logged.
  */
 
-export const CATALOG_LOOKUP_CHUNK = 50;
+// lookup_catalog rejects more than 10 IDs per call ("array size at `/catalog/ids` is greater than: 10")
+export const CATALOG_LOOKUP_CHUNK = 10;
 export const DEFAULT_CATALOG_TIMEOUT_MS = 8000;
 
 const VARIANT_GID = 'gid://shopify/ProductVariant/';
