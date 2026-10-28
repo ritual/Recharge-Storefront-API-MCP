@@ -656,6 +656,9 @@ Storefront sessions minted for a customer by email can read but not write: Recha
 | `skip_subscription` | `GET /subscriptions/{id}` → `customer_id` | `POST /addresses/{address_id}/charges/skip` |
 | `update_address` | `GET /addresses/{id}` → `customer_id` | `PUT /addresses/{id}` |
 | `skip_charge` | `GET /charges/{id}` → `customer.id`, and every `purchase_item_id` is on the charge | `POST /charges/{id}/skip` |
+| `update_subscription` (quantity only) | `GET /subscriptions/{id}` → `customer_id`; must be active and not prepaid | `PUT /subscriptions/{id}?commit=true` with `{"quantity": N}` |
+| `create_onetime` | `GET /addresses/{id}` → `customer_id` and an active subscription there; date of a queued charge (`GET /charges`); allowlisted, published variant (`GET /products/{id}`); no duplicate (`GET /onetimes`) | `POST /onetimes` |
+| `create_subscription` | As `create_onetime`, plus a subscription plan for the variant (`GET /plans`), no active subscription for the variant on the address, and the interval matches an active non-prepaid subscription there | `POST /subscriptions` |
 
 Each call looks the customer up by `customer_email` (refusing 0 or >1 matches), loads the target with the admin token, and only writes if it belongs to that customer. Missing email, unknown or ambiguous email, not-found and owned-by-someone-else are all refused before any write is sent, with an error telling the assistant to hand off to a support agent. Not-found and wrong-owner get the same message, so other customers' IDs can't be probed. `session_token`, `customer_id` and `admin_token` from the caller are never used by these tools; read tools are unchanged.
 
@@ -664,7 +667,17 @@ Each call looks the customer up by `customer_email` (refusing 0 or >1 matches), 
 - Without hosted mode it is always off, and `MCP_VERIFIED_ADMIN_WRITES=true` is ignored with a startup warning.
 - `MCP_VERIFIED_ADMIN_WRITES=transitional` (hosted mode off only) is a cutover aid: a write call with `customer_email` and no `session_token`/`admin_token` takes the verified path, while calls that still pass a token keep the legacy behaviour. Use it only while migrating a client from token-based writes to email-based ones, then turn hosted mode on and remove it. The ownership check is only as strong as the source of `customer_email`: in hosted mode the client maps it from a verified contact, but otherwise the caller supplies it, so enabling these writes there would let any caller make admin-token writes for any customer whose email they know.
 - Subscription, address and charge IDs must be digits only, the fetched record's `id` must match the requested ID, and the write uses the IDs from the verified record (for `skip_charge`, the charge's own `purchase_item_id`s), never the raw input.
-- `RECHARGE_ADMIN_TOKEN` needs `read_customers`/`write_customers` (lookup, addresses), `read_subscriptions`/`write_subscriptions` and `read_orders`/`write_orders` (charges).
+- `RECHARGE_ADMIN_TOKEN` needs `read_customers`/`write_customers` (lookup, addresses), `read_subscriptions`/`write_subscriptions` and `read_orders`/`write_orders` (charges), plus `read_products` and `read_plans` for adding products.
+
+#### Quantity changes and added products
+
+- **Only listed arguments.** In verified mode `update_subscription` accepts only `customer_email`, `subscription_id` and `quantity`; `create_onetime` only `customer_email`, `address_id`, `variant_id`, `quantity` and `next_charge_scheduled_at`; `create_subscription` those plus `order_interval_frequency` and `order_interval_unit`. Any other argument (price, variant, interval, date, properties, anything unknown) is refused before any request, rather than silently dropped. In hosted mode the listed schemas and descriptions show only these arguments and the rules for the assistant.
+- **Quantity cap.** `MCP_VERIFIED_MAX_QUANTITY` (whole number 1-10, default 2) caps the new subscription quantity and the quantity of an added product. Decreases down to 1 are allowed.
+- **Addable products.** Only variants in `MCP_VERIFIED_ADDABLE_VARIANTS` (`shopifyProductId:shopifyVariantId` pairs) can be added, and only while the admin catalog shows them published. Empty or unset means nothing can be added. `find_addable_product` looks a product up by name among them. The price is never sent: Recharge prices the item.
+- **One-time adds always join an existing order.** The date must be the date of one of the customer's upcoming queued charges on that address; with no queued charge the add is refused rather than creating a separate shipment.
+- **Recurring adds copy an existing schedule.** The requested interval must match an active, non-prepaid subscription on that address, and the new subscription copies that subscription's interval fields (and day of month/week).
+- **Write failures.** If Recharge rejects the write (4xx) the assistant is told nothing was changed. If the outcome is unknown (5xx or timeout) it is told not to retry and to hand off, so an add is never duplicated.
+- `delete_onetime` is not a verified write tool, so in hosted mode an add can only be undone by a person.
 
 ### Important: API URL Behavior
 

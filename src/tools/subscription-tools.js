@@ -4,6 +4,7 @@
  */
 import * as z from 'zod';
 import { shapeResponse, shapeChargeResponse, SUBSCRIPTION_FIELDS } from '../utils/response-shaping.js';
+import { VERIFIED_PURCHASE_RULES } from '../utils/verified-writes.js';
 
 const baseSchema = z.object({
   customer_id: z.string().optional().describe('Customer ID for automatic session creation (optional, used when no session_token provided)'),
@@ -199,7 +200,36 @@ export const subscriptionTools = [
     name: 'create_subscription',
     description: 'Create a new subscription',
     inputSchema: createSubscriptionSchema,
+    // Verified admin writes: the only arguments accepted, and the listed description
+    verifiedArgs: ['customer_email', 'address_id', 'variant_id', 'quantity', 'next_charge_scheduled_at', 'order_interval_frequency', 'order_interval_unit'],
+    verifiedScope: 'Only a product, a quantity and a schedule matching an existing subscription can be set when adding a subscription',
+    verifiedDescription: maxQuantity =>
+      `Add a new recurring item (1-${maxQuantity} units) that ships on the same schedule as an existing active subscription at that address. ` +
+      'Use find_addable_product for variant_id and get_subscriptions for that subscription; pass its order_interval_frequency, ' +
+      'order_interval_unit and next_charge_scheduled_at. Ask the customer whether they want a one-time add or a recurring add; never pick for them. ' +
+      'Confirm the price as the catalog list price; the final charge is calculated by Recharge. ' +
+      VERIFIED_PURCHASE_RULES,
     execute: async (client, args) => {
+      if (client.verifiedAdminWrites) {
+        const subscription = await client.verifiedCreateSubscription({
+          addressId: args.address_id,
+          variantId: args.variant_id,
+          quantity: args.quantity,
+          date: args.next_charge_scheduled_at,
+          orderIntervalFrequency: args.order_interval_frequency,
+          orderIntervalUnit: args.order_interval_unit,
+        }, args.customer_email);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Created Subscription:\n${JSON.stringify(shapeResponse(subscription, 'subscription', SUBSCRIPTION_FIELDS), null, 2)}`,
+            },
+          ],
+        };
+      }
+
       // Validate variant_id is positive
       if (args.variant_id <= 0) {
         return {
@@ -441,7 +471,28 @@ export const subscriptionTools = [
     name: 'update_subscription',
     description: 'Update subscription details like frequency, quantity, or next charge date',
     inputSchema: updateSubscriptionSchema,
+    // Verified admin writes: quantity only
+    verifiedArgs: ['customer_email', 'subscription_id', 'quantity'],
+    verifiedScope: 'Only the quantity of an existing subscription can be changed',
+    verifiedDescription: maxQuantity =>
+      `Change only how many units of one existing active subscription ship each time (1-${maxQuantity}). ` +
+      'Frequency, product, date, price and address can\'t be changed here. Use get_subscriptions first; confirm the product, ' +
+      'the current and new quantity, and the per-shipment price (subscription price x new quantity, before tax, shipping and discounts). ' +
+      VERIFIED_PURCHASE_RULES,
     execute: async (client, args) => {
+      if (client.verifiedAdminWrites) {
+        const result = await client.verifiedUpdateSubscriptionQuantity(args.subscription_id, args.quantity, args.customer_email);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Updated Subscription Quantity:\n${JSON.stringify(shapeResponse(result, 'subscription', SUBSCRIPTION_FIELDS), null, 2)}`,
+            },
+          ],
+        };
+      }
+
       // Additional business logic validation
       const { subscription_id, order_interval_frequency, order_interval_unit, quantity, variant_id, next_charge_scheduled_at } = args;
 

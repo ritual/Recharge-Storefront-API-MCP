@@ -3,6 +3,8 @@
  * Last updated: 2024-12-24
  */
 import * as z from 'zod';
+import { shapeResponse, ONETIME_FIELDS } from '../utils/response-shaping.js';
+import { VERIFIED_PURCHASE_RULES } from '../utils/verified-writes.js';
 
 const baseSchema = z.object({
   customer_id: z.string().optional().describe('Customer ID for automatic session creation (optional, used when no session_token provided)'),
@@ -27,6 +29,7 @@ const createOnetimeSchema = z.object({
   session_token: z.string().optional().describe('Recharge session token (optional, takes precedence over environment variable if provided)'),
   admin_token: z.string().optional().describe('Recharge admin token (optional, takes precedence over environment variable if provided)'),
   store_url: z.string().optional().describe('Store URL (optional, takes precedence over environment variable if provided)'),
+  address_id: z.string().optional().describe('The address ID whose upcoming order the item is added to'),
   variant_id: z.number().describe('Product variant ID'),
   quantity: z.number().describe('Quantity'),
   next_charge_scheduled_at: z.string().describe('Next charge date (YYYY-MM-DD format)'),
@@ -98,7 +101,34 @@ export const onetimeTools = [
     name: 'create_onetime',
     description: 'Create a one-time product to add to next delivery',
     inputSchema: createOnetimeSchema,
+    // Verified admin writes: the only arguments accepted, and the listed description
+    verifiedArgs: ['customer_email', 'address_id', 'variant_id', 'quantity', 'next_charge_scheduled_at'],
+    verifiedScope: 'Only a product and a quantity can be added to an upcoming order',
+    verifiedDescription: maxQuantity =>
+      `Add a one-time item (1-${maxQuantity} units) to the customer's next order. Use find_addable_product for variant_id, ` +
+      'get_addresses for address_id, and get_charges (queued) for the order date, and pass that date as next_charge_scheduled_at. ' +
+      'Ask the customer whether they want a one-time add or a recurring add; never pick for them. ' +
+      'Confirm the price as the catalog list price; the final charge is calculated by Recharge. ' +
+      VERIFIED_PURCHASE_RULES,
     execute: async (client, args) => {
+      if (client.verifiedAdminWrites) {
+        const onetime = await client.verifiedCreateOnetime({
+          addressId: args.address_id,
+          variantId: args.variant_id,
+          quantity: args.quantity,
+          date: args.next_charge_scheduled_at,
+        }, args.customer_email);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Created One-time Product:\n${JSON.stringify(shapeResponse(onetime, 'onetime', ONETIME_FIELDS), null, 2)}`,
+            },
+          ],
+        };
+      }
+
       const onetimeData = { ...args };
       delete onetimeData.customer_id;
       delete onetimeData.customer_email;
