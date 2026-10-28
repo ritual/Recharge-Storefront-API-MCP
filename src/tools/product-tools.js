@@ -84,7 +84,8 @@ export const productTools = [
       query: z.string().min(1).max(100).describe('The product name the customer used'),
     }),
     execute: async (client, args) => {
-      if (client.addableVariants.size === 0) {
+      // No allowlist or no Shopify catalog configured: nothing can be added
+      if (client.addableVariants.size === 0 || !client.catalog) {
         return {
           content: [
             {
@@ -95,13 +96,19 @@ export const productTools = [
         };
       }
 
-      // Admin catalog read; caller tokens are stripped in hosted mode, so this uses the server's admin token
+      // Public Shopify storefront catalog read, plus admin reads (caller tokens are stripped in
+      // hosted mode, so the server's admin token) of the customer's addresses for the country and plans
       let result;
       try {
-        result = await client.findAddableProducts(args.query);
+        result = await client.findAddableProducts(args.query, args.customer_email);
       } catch (error) {
+        if (error && error.verifiedRefusal) {
+          // Unknown or ambiguous customer: the customer-safe refusal, never a raw error
+          return { content: [{ type: 'text', text: error.message }], isError: true };
+        }
         if (process.env.DEBUG === 'true') {
-          console.error(`[DEBUG] find_addable_product failed with status ${error.statusCode ?? 'unknown'}`);
+          const code = error && error.code ? ` (${error.code})` : '';
+          console.error(`[DEBUG] find_addable_product failed with status ${(error && error.statusCode) ?? 'unknown'}${code}`);
         }
         return {
           content: [

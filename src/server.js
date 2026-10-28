@@ -31,6 +31,7 @@ import {
   verifiedArgsRefusalMessage,
   verifiedSchemaRefusalMessage,
 } from './utils/verified-writes.js';
+import { createShopifyCatalog, parseShopifyCatalogConfig } from './utils/shopify-catalog.js';
 
 /**
  * Server statistics tracking
@@ -94,6 +95,20 @@ const VERIFIED_WRITE_TOOLS = new Set([
  */
 const verifiedMaxQuantity = parseMaxQuantity(process.env.MCP_VERIFIED_MAX_QUANTITY);
 const addableVariants = parseAddableVariants(process.env.MCP_VERIFIED_ADDABLE_VARIANTS);
+
+/**
+ * Catalog for added products: Recharge's GET /products only works on Custom
+ * stores (422 on Shopify Checkout Integration), so variant, price and
+ * availability come from Shopify's public UCP storefront MCP endpoint
+ * (MCP_SHOPIFY_UCP_URL, e.g. https://ritual.com/api/ucp/mcp), identified by
+ * the server's UCP agent profile (MCP_UCP_AGENT_PROFILE). Both must be https
+ * URLs; if either is missing or invalid nothing can be added.
+ */
+const shopifyCatalogConfig = parseShopifyCatalogConfig(process.env.MCP_SHOPIFY_UCP_URL, process.env.MCP_UCP_AGENT_PROFILE);
+const shopifyCatalog = shopifyCatalogConfig.config ? createShopifyCatalog(shopifyCatalogConfig.config) : null;
+if (!shopifyCatalog && shopifyCatalogConfig.warnings.length === 0 && addableVariants.variants.size > 0) {
+  shopifyCatalogConfig.warnings.push('MCP_VERIFIED_ADDABLE_VARIANTS is set but MCP_SHOPIFY_UCP_URL and MCP_UCP_AGENT_PROFILE are not; adding products is disabled');
+}
 
 /**
  * Tools hidden from listing and rejected on call (comma-separated names)
@@ -307,7 +322,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       adminToken,
       verifiedAdminWrites: verifiedWrite,
       verifiedMaxQuantity: verifiedMaxQuantity.value,
-      addableVariants: addableVariants.variants
+      addableVariants: addableVariants.variants,
+      catalog: shopifyCatalog,
     });
     
     // Track customer for statistics
@@ -446,6 +462,9 @@ async function main() {
     for (const warning of addableVariants.warnings) {
       console.error(`[WARNING] ${warning}`);
     }
+    for (const warning of shopifyCatalogConfig.warnings) {
+      console.error(`[WARNING] ${warning}`);
+    }
     
     if (process.env.RECHARGE_ADMIN_TOKEN === 'your_admin_token_here') {
       console.error('[WARNING] Please update RECHARGE_ADMIN_TOKEN with your actual admin token');
@@ -464,6 +483,7 @@ async function main() {
       console.error('[DEBUG] Admin token:', hasAdminToken ? 'Configured' : 'Not configured');
       console.error('[DEBUG] Verified admin writes:', verifiedAdminWrites ? 'Enabled' : (verifiedAdminWritesTransitional ? 'Transitional' : 'Disabled'));
       console.error('[DEBUG] Verified max quantity:', verifiedMaxQuantity.value, '- addable variants:', addableVariants.variants.size);
+      console.error('[DEBUG] Shopify catalog for adds:', shopifyCatalog ? 'Configured' : 'Not configured');
       console.error('[DEBUG] Session token:', (process.env.RECHARGE_SESSION_TOKEN && process.env.RECHARGE_SESSION_TOKEN.trim() !== '') ? 'Configured' : 'Not configured');
       console.error('[INFO] Server ready - listening for MCP requests');
     }

@@ -2,6 +2,7 @@ import axios from 'axios';
 import { handleAPIError } from './utils/error-handler.js';
 import { SessionCache } from './utils/session-cache.js';
 import { DEFAULT_VERIFIED_MAX_QUANTITY } from './utils/verified-writes.js';
+import { currencyFractionDigits } from './utils/shopify-catalog.js';
 
 /**
  * Resource IDs are interpolated into endpoint paths, so reject anything that
@@ -20,7 +21,22 @@ const VERIFIED_INTERVAL_UNITS = ['day', 'week', 'month'];
 const VERIFIED_GIFT_PROPERTY = /^_*(gwp|gift|free|promo)/i;
 // find_addable_product caches catalog reads per process; write-time checks always read fresh
 const ADDABLE_PRODUCT_CACHE_TTL_MS = 60 * 1000;
-const addableProductCache = new Map();
+// Per catalog instance: "country:variantIds" -> { at, variants }
+const addableProductCache = new WeakMap();
+// Catalog country when a customer's addresses don't share one (or no customer is given)
+const DEFAULT_CATALOG_COUNTRY = 'US';
+// The store's base currency: a created record that names no currency is only trusted against this
+const STORE_BASE_CURRENCY = 'USD';
+// Currency each store market is priced in; a catalog price in another currency is never used
+const MARKET_CURRENCY = { US: 'USD', CA: 'CAD', GB: 'GBP' };
+
+/**
+ * The catalog priced this variant in the currency of the country's market
+ * (countries without a known market accept whatever the catalog returned).
+ */
+function marketCurrencyMatches(country, currency) {
+  return !MARKET_CURRENCY[country] || MARKET_CURRENCY[country] === currency;
+}
 
 /**
  * Recharge 2021-11 returns external IDs as { ecommerce: "123" } on purchase
@@ -55,6 +71,14 @@ function money(value) {
 }
 
 /**
+ * A Recharge address country_code as ISO alpha-2 uppercase, or '' if unusable.
+ */
+function countryCode(value) {
+  const code = String(value ?? '').trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(code) ? code : '';
+}
+
+/**
  * Lowercased whole words of a product title or query, for word matching.
  */
 function titleWords(text) {
@@ -83,6 +107,7 @@ export class RechargeClient {
     verifiedAdminWrites = false,
     verifiedMaxQuantity = DEFAULT_VERIFIED_MAX_QUANTITY,
     addableVariants = new Map(),
+    catalog = null,
   }) {
     if (!storeUrl) {
       throw new Error('Store URL is required');
@@ -130,6 +155,8 @@ export class RechargeClient {
     this.verifiedMaxQuantity = verifiedMaxQuantity;
     // Shopify variant ID -> Shopify product ID that verified writes may add
     this.addableVariants = addableVariants instanceof Map ? addableVariants : new Map();
+    // Shopify storefront catalog (src/utils/shopify-catalog.js); without it nothing can be added
+    this.catalog = catalog && typeof catalog.lookupVariants === 'function' ? catalog : null;
     this.sessionCache = new SessionCache();
     this.currentDomain = domain; // Store current domain for cache management
 
@@ -1477,7 +1504,8 @@ export class RechargeClient {
         throw error;
       }
       if (process.env.DEBUG === 'true') {
-        console.error(`[DEBUG] Verified pre-write check failed with status ${(error && error.statusCode) ?? 'unknown'}`);
+        const code = error && error.code ? ` (${error.code})` : '';
+        console.error(`[DEBUG] Verified pre-write check failed with status ${(error && error.statusCode) ?? 'unknown'}${code}`);
       }
       throw verifiedWriteRefusal('This could not be checked right now, so nothing was changed.');
     }
@@ -1630,49 +1658,45 @@ export class RechargeClient {
   }
 
   /**
-   * Load an allowlisted variant from the admin catalog. Not-allowlisted,
-   * missing, unpublished, unpriced and not-subscribable all get the same
-   * refusal. Everything returned comes from the catalog record, never the caller.
+   * Load an allowlisted variant from the Shopify storefront catalog, priced
+   * for the address's country. Always a fresh read (never cached). Not
+   * configured, not allowlisted, no country, missing, another product,
+   * unavailable, unpriced and not-subscribable all get the same refusal.
+   * Everything returned comes from the catalog record, never the caller.
    */
-  async getVerifiedAddableVariant(variantId, planType) {
+  async getVerifiedAddableVariant(variantId, planType, addressCountry) {
     const refusal = verifiedWriteRefusal(
       `That product can't be added here, so nothing was added. ` +
       `Use find_addable_product to look up the product the customer named; if it is not found, ${VERIFIED_HANDOFF}.`
     );
     const requested = String(variantId ?? '').trim();
     const productId = this.addableVariants.get(requested);
-    if (!productId) {
+    if (!productId || !this.catalog) {
       if (process.env.DEBUG === 'true') {
-        console.error(`[DEBUG] Verified add refused: variant ${requested} is not addable`);
+        console.error(`[DEBUG] Verified add refused: variant ${requested} is not addable${this.catalog ? '' : ' (no catalog configured)'}`);
+      }
+      throw refusal;
+    }
+    const country = countryCode(addressCountry);
+    if (!country) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: the address has no usable country_code`);
       }
       throw refusal;
     }
 
-    let response;
-    try {
-      response = await this.makeAdminRequest('GET', `/products/${productId}`);
-    } catch (error) {
-      if (error.statusCode === 404) {
-        throw refusal;
-      }
-      throw error;
-    }
-
-    const product = response && response.product;
-    const variant = product && Array.isArray(product.variants)
-      ? product.variants.find(item => externalId(item.external_variant_id) === requested)
-      : undefined;
-    const publishedAt = product ? Date.parse(product.published_at || '') : NaN;
-    if (!product || (product.external_product_id !== undefined && externalId(product.external_product_id) !== productId) ||
-        !variant || Number.isNaN(publishedAt) || publishedAt > Date.now()) {
+    // A catalog failure propagates, so the pre-write checks refuse with "could not be checked"
+    const variant = (await this.catalog.lookupVariants([requested], country)).get(requested);
+    if (!variant || variant.productId !== productId || variant.available !== true ||
+        !marketCurrencyMatches(country, variant.currency)) {
       if (process.env.DEBUG === 'true') {
-        console.error(`[DEBUG] Verified add refused: variant ${requested} is not sellable in product ${productId}`);
+        console.error(`[DEBUG] Verified add refused: variant ${requested} is not sellable in product ${productId} for ${country}`);
       }
       throw refusal;
     }
 
     // A zero, missing or unreadable catalog price is never added (sample, gift or sync gap)
-    const unitPrice = money(variant.prices?.unit_price ?? variant.price);
+    const unitPrice = variant.unitPrice;
     if (!(unitPrice > 0)) {
       if (process.env.DEBUG === 'true') {
         console.error(`[DEBUG] Verified add refused: variant ${requested} has no positive catalog price`);
@@ -1693,10 +1717,11 @@ export class RechargeClient {
 
     return {
       productId,
-      variantId: externalId(variant.external_variant_id),
-      title: product.title,
-      variantTitle: variant.title,
+      variantId: requested,
+      title: variant.productTitle,
+      variantTitle: variant.variantTitle,
       unitPrice,
+      currency: variant.currency,
       plans,
     };
   }
@@ -1731,20 +1756,27 @@ export class RechargeClient {
 
   /**
    * After an add, the price Recharge set must be positive and no more than
-   * the catalog list price the customer was told. Otherwise the record just
-   * created is deleted again and the add is refused; if that delete fails,
-   * the assistant is told the outcome is unknown. Only IDs are logged.
+   * the catalog list price the customer was told, and in the catalog's
+   * currency (compare-at prices are never used). A record that names no
+   * currency is only trusted when the catalog price is in the store's base
+   * currency, since its price can't be compared with another currency.
+   * Otherwise the record just created is deleted again and the add is
+   * refused; if that delete fails, the assistant is told the outcome is
+   * unknown. Only IDs are logged.
    */
-  async verifiedCheckCreatedPrice(collection, key, response, addressId, catalogPrice) {
+  async verifiedCheckCreatedPrice(collection, key, response, addressId, catalogPrice, catalogCurrency) {
     const record = response && response[key];
     const price = money(record && record.price);
-    if (price > 0 && price <= catalogPrice + 0.005) {
+    const recordCurrency = record ? String(record.presentment_currency || record.currency || '').trim().toUpperCase() : '';
+    const expectedCurrency = String(catalogCurrency || '').toUpperCase();
+    const sameCurrency = recordCurrency === '' ? expectedCurrency === STORE_BASE_CURRENCY : recordCurrency === expectedCurrency;
+    if (price > 0 && price <= catalogPrice + 0.005 && sameCurrency) {
       return response;
     }
 
     const id = record && record.id;
     if (process.env.DEBUG === 'true') {
-      console.error(`[DEBUG] Verified add on ${collection} ${id ?? 'unknown'} was priced outside the catalog price; removing it`);
+      console.error(`[DEBUG] Verified add on ${collection} ${id ?? 'unknown'} was priced outside the catalog price or currency; removing it`);
     }
     let removed = false;
     if (record && /^\d+$/.test(String(id ?? '')) && String(record.address_id) === String(addressId)) {
@@ -1839,7 +1871,7 @@ export class RechargeClient {
       const customerId = await this.resolveVerifiedCustomerId(customerEmail);
       const { address, activeSubscriptions } = await this.getVerifiedActiveAddress(id, customerId);
       const scheduledAt = await this.getVerifiedQueuedChargeDate(address.id, customerId, date);
-      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'onetime');
+      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'onetime', address.country_code);
 
       const onetimes = await this.getVerifiedOnetimes(address.id, customerId);
       if (onetimes.some(onetime =>
@@ -1869,7 +1901,7 @@ export class RechargeClient {
     if (process.env.DEBUG === 'true') {
       console.error(`[DEBUG] Verified one-time add of variant ${variant.variantId} on address ${address.id} for customer ${customerId}`);
     }
-    return await this.verifiedCheckCreatedPrice('onetimes', 'onetime', response, address.id, variant.unitPrice);
+    return await this.verifiedCheckCreatedPrice('onetimes', 'onetime', response, address.id, variant.unitPrice, variant.currency);
   }
 
   async verifiedCreateSubscription({ addressId, variantId, quantity, date, orderIntervalFrequency, orderIntervalUnit }, customerEmail) {
@@ -1886,7 +1918,7 @@ export class RechargeClient {
     const { customerId, address, scheduledAt, variant, matched, plan } = await this.verifiedPreWriteChecks(async () => {
       const customerId = await this.resolveVerifiedCustomerId(customerEmail);
       const { address, activeSubscriptions } = await this.getVerifiedActiveAddress(id, customerId);
-      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'subscription');
+      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'subscription', address.country_code);
 
       if (activeSubscriptions.some(subscription => externalId(subscription.external_variant_id) === variant.variantId)) {
         throw verifiedWriteRefusal(
@@ -1971,83 +2003,97 @@ export class RechargeClient {
     if (process.env.DEBUG === 'true') {
       console.error(`[DEBUG] Verified subscription add of variant ${variant.variantId} on address ${address.id} for customer ${customerId}`);
     }
-    return await this.verifiedCheckCreatedPrice('subscriptions', 'subscription', response, address.id, variant.unitPrice);
+    return await this.verifiedCheckCreatedPrice('subscriptions', 'subscription', response, address.id, variant.unitPrice, variant.currency);
   }
 
   /**
-   * Catalog product for find_addable_product, cached per process for a short
-   * time so a search doesn't re-read every allowlisted product. Write-time
-   * checks never use this cache.
+   * Catalog country for find_addable_product: the customer's addresses'
+   * country_code when they all share one, otherwise US. Without an email
+   * (local, non-hosted use) there is no customer to read, so US.
    */
-  async getCachedCatalogProduct(productId) {
-    const key = `${this.currentDomain}:${productId}`;
-    const cached = addableProductCache.get(key);
+  async getAddableLookupCountry(customerEmail) {
+    if (typeof customerEmail !== 'string' || customerEmail.trim() === '') {
+      return DEFAULT_CATALOG_COUNTRY;
+    }
+    const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+    const response = await this.makeAdminRequest('GET', '/addresses', null, { customer_id: customerId, limit: 250 });
+    const countries = new Set(((response && response.addresses) || [])
+      .filter(address => String(address.customer_id) === String(customerId))
+      .map(address => countryCode(address.country_code)));
+    const [only] = countries;
+    return countries.size === 1 && only ? only : DEFAULT_CATALOG_COUNTRY;
+  }
+
+  /**
+   * Every allowlisted variant from the catalog for a country, cached per
+   * process for a short time so a search doesn't re-read the catalog.
+   * Write-time checks never use this cache.
+   */
+  async getCachedAddableCatalog(country) {
+    const ids = [...this.addableVariants.keys()].sort();
+    const key = `${country}:${ids.join(',')}`;
+    let byKey = addableProductCache.get(this.catalog);
+    if (!byKey) {
+      byKey = new Map();
+      addableProductCache.set(this.catalog, byKey);
+    }
+    const cached = byKey.get(key);
     if (cached && Date.now() - cached.at < ADDABLE_PRODUCT_CACHE_TTL_MS) {
-      return cached.product;
+      return cached.variants;
     }
-    let product = null;
-    try {
-      const response = await this.makeAdminRequest('GET', `/products/${productId}`);
-      product = (response && response.product) || null;
-    } catch (error) {
-      if (error.statusCode !== 404) {
-        throw error;
-      }
-    }
-    addableProductCache.set(key, { at: Date.now(), product });
-    return product;
+    const variants = await this.catalog.lookupVariants(ids, country);
+    byKey.set(key, { at: Date.now(), variants });
+    return variants;
   }
 
   /**
-   * Read-only lookup of allowlisted, currently published, priced variants
-   * whose product or variant title matches the query. Every query word must
-   * be a whole word of the title or the start of one ("men" never matches
-   * "women").
+   * Read-only lookup of allowlisted, available, priced variants whose
+   * product or variant title matches the query, priced in the customer's
+   * country. Every query word must be a whole word of the title or the start
+   * of one ("men" never matches "women"). A variant the catalog doesn't
+   * return for its allowlisted product is skipped, not fatal. Descriptions
+   * are never read into the result.
    */
-  async findAddableProducts(query) {
+  async findAddableProducts(query, customerEmail) {
     const words = titleWords(query);
-    if (this.addableVariants.size === 0 || words.length === 0) {
+    if (this.addableVariants.size === 0 || !this.catalog || words.length === 0) {
       return { products: [] };
     }
 
-    const variantsByProduct = new Map();
-    for (const [variantId, productId] of this.addableVariants) {
-      variantsByProduct.set(productId, [...(variantsByProduct.get(productId) || []), variantId]);
-    }
+    const country = await this.getAddableLookupCountry(customerEmail);
+    const catalog = await this.getCachedAddableCatalog(country);
 
     const products = [];
-    for (const [productId, variantIds] of variantsByProduct) {
-      const product = await this.getCachedCatalogProduct(productId);
-      const publishedAt = product ? Date.parse(product.published_at || '') : NaN;
-      if (!product || !Array.isArray(product.variants) || Number.isNaN(publishedAt) || publishedAt > Date.now()) {
+    for (const [variantId, productId] of this.addableVariants) {
+      const variant = catalog.get(variantId);
+      if (!variant || variant.productId !== productId || variant.available !== true || !(variant.unitPrice > 0) ||
+          !marketCurrencyMatches(country, variant.currency)) {
+        if (process.env.DEBUG === 'true') {
+          console.error(`[DEBUG] find_addable_product skipped variant ${variantId}: not sellable in product ${productId} for ${country}`);
+        }
         continue;
       }
-
-      for (const variantId of variantIds) {
-        const variant = product.variants.find(item => externalId(item.external_variant_id) === variantId);
-        const unitPrice = variant ? money(variant.prices?.unit_price ?? variant.price) : NaN;
-        const titleTokens = titleWords(`${product.title || ''} ${variant ? variant.title || '' : ''}`);
-        if (!variant || !(unitPrice > 0) ||
-            !words.every(word => titleTokens.some(token => token === word || token.startsWith(word)))) {
-          continue;
-        }
-        let canSubscribe = false;
-        try {
-          canSubscribe = (await this.getVerifiedSubscriptionPlans(productId, variantId)).length > 0;
-        } catch (error) {
-          if (process.env.DEBUG === 'true') {
-            console.error(`[DEBUG] Plan lookup failed for product ${productId}:`, error.message);
-          }
-        }
-        products.push({
-          // A number, as create_onetime and create_subscription take it (allowlisted IDs are safe integers)
-          variant_id: Number(variantId),
-          title: product.title,
-          variant_title: variant.title,
-          unit_price: variant.prices?.unit_price ?? variant.price ?? null,
-          can_subscribe: canSubscribe,
-        });
+      const titleTokens = titleWords(`${variant.productTitle} ${variant.variantTitle}`);
+      if (!words.every(word => titleTokens.some(token => token === word || token.startsWith(word)))) {
+        continue;
       }
+      let canSubscribe = false;
+      try {
+        canSubscribe = (await this.getVerifiedSubscriptionPlans(productId, variantId)).length > 0;
+      } catch (error) {
+        if (process.env.DEBUG === 'true') {
+          console.error(`[DEBUG] Plan lookup failed for product ${productId}:`, error.message);
+        }
+      }
+      products.push({
+        // A number, as create_onetime and create_subscription take it (allowlisted IDs are safe integers)
+        variant_id: Number(variantId),
+        title: variant.productTitle,
+        variant_title: variant.variantTitle,
+        unit_price: variant.unitPrice.toFixed(currencyFractionDigits(variant.currency)),
+        currency: variant.currency,
+        can_subscribe: canSubscribe,
+      });
     }
     return { products };
   }

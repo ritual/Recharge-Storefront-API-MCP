@@ -82,6 +82,18 @@ export function handleAPIError(error) {
     } else if (data?.errors && Array.isArray(data.errors) && data.errors.length > 0) {
       const firstError = data.errors[0];
       message = typeof firstError === 'string' ? firstError : firstError?.message || JSON.stringify(firstError);
+    } else if (data?.errors && typeof data.errors === 'object' && !Array.isArray(data.errors) && Object.keys(data.errors).length > 0) {
+      // Recharge validation errors keyed by field, e.g. {"platform": ["This API is not compatible with your platform"]}
+      message = Object.entries(data.errors)
+        .map(([field, value]) => {
+          const text = Array.isArray(value)
+            ? value.map(item => (typeof item === 'string' ? item : JSON.stringify(item))).join(', ')
+            : (typeof value === 'string' ? value : JSON.stringify(value));
+          return `${field}: ${text}`;
+        })
+        .join('; ');
+    } else if (typeof data?.errors === 'string' && data.errors.trim() !== '') {
+      message = data.errors;
     } else if (data?.error_description) {
       message = data.error_description;
     } else if (status) {

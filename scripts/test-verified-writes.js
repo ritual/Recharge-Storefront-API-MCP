@@ -4,9 +4,11 @@
  * Tests for verified quantity changes and added products
  *
  * No network: the client's makeAdminRequest is replaced by an in-memory
- * router that records every call, and the server is spawned with fake
- * credentials, an unreachable RECHARGE_API_URL and an empty working directory
- * (so no .env is loaded). Every refusal asserts that no POST or PUT was sent.
+ * router that records every call, the Shopify catalog gets a fake fetch that
+ * serves records in the live UCP lookup_catalog shape, and the server is
+ * spawned with fake credentials, an unreachable RECHARGE_API_URL and an empty
+ * working directory (so no .env is loaded). Every refusal asserts that no
+ * POST or PUT was sent.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,7 +18,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RechargeClient } from '../src/recharge-client.js';
-import { RechargeAPIError } from '../src/utils/error-handler.js';
+import { RechargeAPIError, handleAPIError } from '../src/utils/error-handler.js';
+import { createShopifyCatalog, parseShopifyCatalogConfig } from '../src/utils/shopify-catalog.js';
 import { tools } from '../src/tools/index.js';
 import {
   DEFAULT_VERIFIED_MAX_QUANTITY,
@@ -27,6 +30,8 @@ import {
 } from '../src/utils/verified-writes.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Live ritual.com IDs: Natalbiotic is USD 68.18 / CAD 106.82 in the storefront catalog
+const NATALBIOTIC = { productId: '7482572079198', variantId: '42144416137310' };
 const EMAIL = 'alice@example.com';
 const OTHER_EMAIL = 'bob@example.com';
 const FAKE_TOKEN = 'fake_admin_token_for_tests_only';
@@ -86,9 +91,10 @@ function fixtures() {
       },
     ],
     addresses: [
-      { id: 501, customer_id: 100 },
-      { id: 502, customer_id: 100 },
-      { id: 601, customer_id: 200 },
+      { id: 501, customer_id: 100, country_code: 'US' },
+      { id: 502, customer_id: 100, country_code: 'US' },
+      // Someone else's address in another country: must never pick alice's catalog country
+      { id: 601, customer_id: 200, country_code: 'CA' },
     ],
     charges: [
       { id: 3001, customer: { id: 100 }, address_id: 501, status: 'queued', scheduled_at: FUTURE_1 },
@@ -100,31 +106,6 @@ function fixtures() {
       { id: 3005, customer: { id: 100 }, address_id: 501, status: 'queued', scheduled_at: LATEST_TODAY },
       { id: 3006, customer: { id: 100 }, address_id: 502, status: 'queued', scheduled_at: FUTURE_1 },
     ],
-    products: {
-      7001: {
-        external_product_id: '7001', title: 'Essential for Women 18+', published_at: '2020-01-01T00:00:00Z',
-        variants: [
-          { external_variant_id: '8001', title: '30 count', prices: { unit_price: '33.00' } },
-          { external_variant_id: '8006', title: '60 count', prices: { unit_price: '60.00' } },
-        ],
-      },
-      7002: {
-        external_product_id: '7002', title: 'Unpublished Thing', published_at: null,
-        variants: [{ external_variant_id: '8003', title: 'Default', prices: { unit_price: '10.00' } }],
-      },
-      7003: {
-        external_product_id: '7003', title: 'Future Thing', published_at: '2099-01-01T00:00:00Z',
-        variants: [{ external_variant_id: '8004', title: 'Default', prices: { unit_price: '10.00' } }],
-      },
-      7005: {
-        external_product_id: '7005', title: 'Protein Powder', published_at: '2020-01-01T00:00:00Z',
-        variants: [{ external_variant_id: '8007', title: 'Chocolate', prices: { unit_price: '40.00' } }],
-      },
-      7006: {
-        external_product_id: '7006', title: 'Free Sample', published_at: '2020-01-01T00:00:00Z',
-        variants: [{ external_variant_id: '8009', title: 'Default', prices: { unit_price: '0.00' } }],
-      },
-    },
     plans: [
       {
         id: 1, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: '7001' }, has_variant_restrictions: false,
@@ -133,6 +114,10 @@ function fixtures() {
       // Product 7005: only a restricted plan for a different variant, plus a deleted one
       { id: 2, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: '7005' }, has_variant_restrictions: true, external_variant_ids: ['9999'] },
       { id: 3, type: 'subscription', deleted_at: '2024-01-01', external_product_id: { ecommerce: '7005' }, has_variant_restrictions: false },
+      {
+        id: 4, type: 'subscription', deleted_at: null, external_product_id: { ecommerce: NATALBIOTIC.productId }, has_variant_restrictions: false,
+        subscription_preferences: { interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1 },
+      },
     ],
     onetimes: [],
   };
@@ -141,13 +126,127 @@ function fixtures() {
 const ADDABLE = new Map([
   ['8001', '7001'], // sellable, subscribable
   ['8006', '7001'], // second variant of the same product
-  ['8003', '7002'], // unpublished
-  ['8004', '7003'], // published in the future
-  ['8005', '7404'], // product 404
-  ['8008', '7001'], // variant missing from the product
+  ['8003', '7002'], // not on the storefront (unpublished): absent from the catalog
+  ['8004', '7003'], // on the storefront but unavailable
+  ['8005', '7404'], // product unknown to the catalog
+  ['8008', '7001'], // variant unknown to the catalog
   ['8007', '7005'], // sellable, no usable subscription plan
-  ['8009', '7006'], // published but priced 0.00
+  ['8009', '7006'], // available but priced 0.00
+  ['8010', '7001'], // the catalog has it under another product (7007)
+  [NATALBIOTIC.variantId, NATALBIOTIC.productId], // real IDs and prices from ritual.com
 ]);
+
+// ---------------------------------------------------------------------------
+// Fake Shopify catalog (UCP lookup_catalog over JSON-RPC)
+// ---------------------------------------------------------------------------
+
+const UCP_URL = 'https://shop.example.com/api/ucp/mcp';
+const PROFILE_URL = 'https://mcp.example.com/ucp/agent-profile.json';
+// Present on every fake catalog record: must never reach tool output or logs
+const DESCRIPTION_MARKER = 'DESCRIPTION-MARKER clinically studied';
+const variantGid = id => `gid://shopify/ProductVariant/${id}`;
+
+function ucpVariant(id, title, amount, currency, { available = true, sku = null } = {}) {
+  return {
+    id: variantGid(id), sku, title,
+    description: { html: `<p>${DESCRIPTION_MARKER}</p>` },
+    price: { amount, currency },
+    availability: { available },
+    inputs: [{ id: variantGid(id), match: 'exact' }],
+  };
+}
+
+function ucpProduct(id, title, handle, variants) {
+  return { id: `gid://shopify/Product/${id}`, title, handle, description: { html: `<p>${DESCRIPTION_MARKER}</p>` }, variants };
+}
+
+/**
+ * Storefront catalog per country, in the shape of a live lookup_catalog
+ * response (amounts are integer minor units, priced per country).
+ */
+function catalogFixtures() {
+  const products = (currency, [p8001, p8006, p8007, natalbiotic]) => [
+    ucpProduct('7001', 'Essential for Women 18+', 'essential-for-women', [
+      ucpVariant('8001', '30 count', p8001, currency),
+      ucpVariant('8006', '60 count', p8006, currency),
+    ]),
+    ucpProduct('7003', 'Future Thing', 'future-thing', [ucpVariant('8004', 'Default Title', 1000, currency, { available: false })]),
+    ucpProduct('7005', 'Protein Powder', 'protein-powder', [ucpVariant('8007', 'Chocolate', p8007, currency)]),
+    ucpProduct('7006', 'Free Sample', 'free-sample', [ucpVariant('8009', 'Default Title', 0, currency)]),
+    ucpProduct('7007', 'Essential for Women 18+ Gummies', 'gummies', [ucpVariant('8010', 'Default Title', 2000, currency)]),
+    ucpProduct(NATALBIOTIC.productId, 'Natalbiotic\u2122', 'natalbiotic', [ucpVariant(NATALBIOTIC.variantId, 'Default Title', natalbiotic, currency, { sku: 'NTLBCT0MUS' })]),
+  ];
+  return {
+    US: products('USD', [3300, 6000, 4000, 6818]),
+    CA: products('CAD', [4500, 8200, 5500, 10682]),
+  };
+}
+
+const rpcResult = (id, content) => ({
+  jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(content) }], structuredContent: content, isError: false },
+});
+
+const jsonResponse = (payload, status = 200) =>
+  new Response(typeof payload === 'string' ? payload : JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
+
+/**
+ * A real catalog client over a fake fetch. `respond(body, init)` replaces
+ * the default in-memory lookup. Every request is kept on `.requests`.
+ */
+function makeCatalog({ db = catalogFixtures(), respond = null, timeoutMs } = {}) {
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url, init, body });
+    if (respond) {
+      return respond(body, init);
+    }
+    const { ids, context } = body.params.arguments.catalog;
+    const products = (db[context.address_country] || []).filter(product => product.variants.some(variant => ids.includes(variant.id)));
+    const returned = new Set(products.flatMap(product => product.variants.map(variant => variant.id)));
+    return jsonResponse(rpcResult(body.id, {
+      products: structuredClone(products),
+      messages: ids.filter(id => !returned.has(id)).map(id => ({ type: 'info', code: 'not_found', content: id })),
+    }));
+  };
+  const catalog = createShopifyCatalog({ endpoint: UCP_URL, profileUrl: PROFILE_URL, fetchImpl, ...(timeoutMs ? { timeoutMs } : {}) });
+  catalog.requests = requests;
+  return catalog;
+}
+
+// A trimmed live response (ritual.com, CA context): only content[0].text, no structuredContent
+const LIVE_LOOKUP_CA = {
+  jsonrpc: '2.0',
+  id: 3,
+  result: {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        products: [
+          {
+            id: 'gid://shopify/Product/7482572079198', title: 'Natalbiotic\u2122', handle: 'natalbiotic',
+            variants: [{
+              id: 'gid://shopify/ProductVariant/42144416137310', sku: 'NTLBCT0MUS', title: 'Default Title',
+              price: { amount: 10682, currency: 'CAD' }, availability: { available: true },
+              inputs: [{ id: 'gid://shopify/ProductVariant/42144416137310', match: 'exact' }],
+            }],
+          },
+          {
+            id: 'gid://shopify/Product/7482572570718', title: 'Women\u2019s Multivitamin 18+', handle: 'essential-for-women-multivitamin',
+            variants: [{
+              id: 'gid://shopify/ProductVariant/42283036246110', sku: 'EW18MT9MUS', title: 'Mint / 30 servings',
+              price: { amount: 5682, currency: 'CAD' }, availability: { available: true },
+              inputs: [{ id: 'gid://shopify/ProductVariant/42283036246110', match: 'exact' }],
+            }],
+          },
+        ],
+        messages: [{ type: 'info', code: 'not_found', content: 'gid://shopify/ProductVariant/99999999999999' }],
+        pagination: null,
+      }),
+    }],
+    isError: false,
+  },
+};
 
 function notFound() {
   return new RechargeAPIError('Not Found', 404);
@@ -157,10 +256,10 @@ function notFound() {
  * Build a client whose admin requests hit the in-memory store. `overrides`
  * maps "METHOD /path" to a handler that replaces the default one.
  */
-// A fresh store domain per client, so the per-process catalog cache never leaks between tests
 let clientCount = 0;
 
-function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQuantity = 2 } = {}) {
+// A fresh catalog per client (default), so the find_addable_product cache never leaks between tests
+function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQuantity = 2, catalog = makeCatalog() } = {}) {
   clientCount += 1;
   const client = new RechargeClient({
     storeUrl: `test-shop-${clientCount}.myshopify.com`,
@@ -168,6 +267,7 @@ function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQua
     verifiedAdminWrites: true,
     verifiedMaxQuantity: maxQuantity,
     addableVariants: addable,
+    catalog,
   });
   const calls = [];
   const byId = (list, id) => list.find(item => String(item.id) === String(id));
@@ -186,6 +286,8 @@ function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQua
         .filter(s => !params.status || s.status === params.status)
         .map(s => structuredClone(s)),
     }),
+    // Deliberately ignores the customer filter: the client must filter by owner itself
+    'GET /addresses': () => ({ addresses: db.addresses.map(a => structuredClone(a)) }),
     'GET /addresses/:id': ({ id }) => {
       const record = byId(db.addresses, id);
       if (!record) throw notFound();
@@ -196,10 +298,6 @@ function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQua
         .filter(c => !params.address_id || String(c.address_id) === String(params.address_id))
         .map(c => structuredClone(c)),
     }),
-    'GET /products/:id': ({ id }) => {
-      if (!db.products[id]) throw notFound();
-      return { product: structuredClone(db.products[id]) };
-    },
     'GET /plans': ({ params }) => ({
       plans: db.plans.filter(p => p.external_product_id.ecommerce === String(params.external_product_id)).map(p => structuredClone(p)),
     }),
@@ -224,7 +322,7 @@ function makeClient({ db = fixtures(), overrides = {}, addable = ADDABLE, maxQua
     return handler({ id: match ? match[2] : null, data, params: params || {} });
   };
 
-  return { client, calls, db };
+  return { client, calls, db, catalog };
 }
 
 const writes = calls => calls.filter(call => call.method !== 'GET');
@@ -383,7 +481,14 @@ describe('verifiedCreateOnetime', () => {
     assert.equal(result.onetime.id, 4001);
   });
 
-  for (const [label, variantId] of [['not allowlisted', 8002], ['product 404', 8005], ['variant missing from product', 8008], ['unpublished', 8003], ['published in the future', 8004]]) {
+  for (const [label, variantId] of [
+    ['not allowlisted', 8002],
+    ['whose product is unknown to the catalog', 8005],
+    ['unknown to the catalog', 8008],
+    ['not on the storefront', 8003],
+    ['unavailable', 8004],
+    ['under another product in the catalog', 8010],
+  ]) {
     test(`variant ${label} gets the same "can't be added" refusal`, async () => {
       const { client, calls } = makeClient();
       await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId }), EMAIL), /That product can't be added here, so nothing was added/);
@@ -581,18 +686,20 @@ describe('verifiedCreateSubscription', () => {
 // ---------------------------------------------------------------------------
 
 describe('find_addable_product', () => {
-  test('matches only allowlisted, published variants and reports can_subscribe', async () => {
+  test('matches only allowlisted, available variants and reports can_subscribe', async () => {
     const { client, calls } = makeClient();
-    const result = await client.findAddableProducts('essential women');
-    // Both allowlisted variants of the product, with variant_id as the number the add tools take
+    const result = await client.findAddableProducts('essential women', EMAIL);
+    // Both allowlisted variants of the product, with variant_id as the number the add tools take;
+    // 8010 (catalog says another product) is skipped
     assert.deepEqual(result.products, [
-      { variant_id: 8001, title: 'Essential for Women 18+', variant_title: '30 count', unit_price: '33.00', can_subscribe: true },
-      { variant_id: 8006, title: 'Essential for Women 18+', variant_title: '60 count', unit_price: '60.00', can_subscribe: true },
+      { variant_id: 8001, title: 'Essential for Women 18+', variant_title: '30 count', unit_price: '33.00', currency: 'USD', can_subscribe: true },
+      { variant_id: 8006, title: 'Essential for Women 18+', variant_title: '60 count', unit_price: '60.00', currency: 'USD', can_subscribe: true },
     ]);
-    assert.deepEqual((await client.findAddableProducts('60 count')).products.map(product => product.variant_id), [8006]);
-    const protein = await client.findAddableProducts('PROTEIN');
+    assert.deepEqual((await client.findAddableProducts('60 count', EMAIL)).products.map(product => product.variant_id), [8006]);
+    const protein = await client.findAddableProducts('PROTEIN', EMAIL);
     assert.equal(protein.products[0].can_subscribe, false);
-    assert.deepEqual((await client.findAddableProducts('unpublished')).products, []);
+    assert.deepEqual((await client.findAddableProducts('unpublished', EMAIL)).products, []);
+    assert.deepEqual((await client.findAddableProducts('future thing', EMAIL)).products, []);
     assert.equal(writes(calls).length, 0);
   });
 
@@ -627,11 +734,15 @@ describe('logging', () => {
       await client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL);
       await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
       await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
-      await client.findAddableProducts('essential');
+      await client.findAddableProducts('essential', EMAIL);
       await client.verifiedUpdateSubscriptionQuantity('2001', 2, EMAIL).catch(() => {});
       await client.verifiedCreateOnetime(onetimeArgs({ variantId: 8002 }), EMAIL).catch(() => {});
       await client.verifiedCreateOnetime(onetimeArgs({ variantId: 8003 }), EMAIL).catch(() => {});
       await client.verifiedCreateSubscription(subscriptionArgs({ variantId: 8007 }), EMAIL).catch(() => {});
+      await client.verifiedCreateOnetime(onetimeArgs({ variantId: 8010 }), EMAIL).catch(() => {});
+      const failingCatalog = makeClient({ catalog: makeCatalog({ respond: () => new Response('nope', { status: 500 }) }) });
+      await failingCatalog.client.verifiedCreateOnetime(onetimeArgs(), EMAIL).catch(() => {});
+      await toolByName('find_addable_product').execute(failingCatalog.client, { customer_email: EMAIL, query: 'essential' });
       const failing = makeClient({ overrides: { 'POST /onetimes': () => { throw new RechargeAPIError('boom', 502); } } });
       await failing.client.verifiedCreateOnetime(onetimeArgs(), EMAIL).catch(() => {});
     } finally {
@@ -646,6 +757,7 @@ describe('logging', () => {
     for (const line of captured) {
       assert.ok(!line.includes(EMAIL), `email in log: ${line}`);
       assert.ok(!line.includes(FAKE_TOKEN), `token in log: ${line}`);
+      assert.ok(!line.includes(DESCRIPTION_MARKER), `description in log: ${line}`);
     }
   });
 });
@@ -683,7 +795,7 @@ describe('price guards on adds', () => {
   test('an allowlisted variant priced 0.00 in the catalog cannot be added or found', async () => {
     const { client, calls } = makeClient();
     await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId: 8009 }), EMAIL), /can't be added here/);
-    assert.deepEqual((await client.findAddableProducts('free sample')).products, []);
+    assert.deepEqual((await client.findAddableProducts('free sample', EMAIL)).products, []);
     assert.equal(writes(calls).length, 0);
   });
 
@@ -832,7 +944,6 @@ describe('pre-write read failures', () => {
   const failing = status => () => { throw new RechargeAPIError(`HTTP ${status} Error`, status); };
   const cases = [
     ['GET /plans 403 (missing read_plans)', 'GET /plans', 403, client => client.verifiedCreateSubscription(subscriptionArgs(), EMAIL)],
-    ['GET /products/:id 429', 'GET /products/:id', 429, client => client.verifiedCreateOnetime(onetimeArgs(), EMAIL)],
     ['GET /charges 500', 'GET /charges', 500, client => client.verifiedCreateOnetime(onetimeArgs(), EMAIL)],
     ['GET /onetimes 422', 'GET /onetimes', 422, client => client.verifiedCreateOnetime(onetimeArgs(), EMAIL)],
     ['GET /subscriptions/:id 503', 'GET /subscriptions/:id', 503, client => client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL)],
@@ -848,27 +959,41 @@ describe('pre-write read failures', () => {
       assert.equal(writes(calls).length, 0);
     });
   }
+
+  test('a catalog 429 is a hand-off refusal with no write', async () => {
+    const catalog = makeCatalog({ respond: () => new Response('Too Many Requests', { status: 429 }) });
+    const { client, calls } = makeClient({ catalog });
+    await assert.rejects(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), error => {
+      assert.equal(error.message, 'This could not be checked right now, so nothing was changed. Do not ask the customer for account IDs or tokens; hand off to a support agent.');
+      return true;
+    });
+    assert.equal(writes(calls).length, 0);
+    assert.equal(catalog.requests.length, 1);
+  });
 });
 
 describe('find_addable_product matching and load', () => {
   test('whole words only: "men" never matches "women"', async () => {
     const { client } = makeClient();
-    assert.deepEqual((await client.findAddableProducts('Essential for Men')).products, []);
-    assert.deepEqual((await client.findAddableProducts('men')).products, []);
-    assert.equal((await client.findAddableProducts('wom')).products.length, 2);
-    assert.equal((await client.findAddableProducts('18+')).products.length, 2);
+    assert.deepEqual((await client.findAddableProducts('Essential for Men', EMAIL)).products, []);
+    assert.deepEqual((await client.findAddableProducts('men', EMAIL)).products, []);
+    assert.equal((await client.findAddableProducts('wom', EMAIL)).products.length, 2);
+    assert.equal((await client.findAddableProducts('18+', EMAIL)).products.length, 2);
   });
 
-  test('catalog reads are cached between searches', async () => {
-    const { client, calls } = makeClient();
-    await client.findAddableProducts('essential');
-    const first = calls.filter(call => call.endpoint.startsWith('/products/')).length;
-    await client.findAddableProducts('protein');
-    assert.equal(calls.filter(call => call.endpoint.startsWith('/products/')).length, first);
+  test('catalog reads are one lookup per search and cached between searches', async () => {
+    const { client, calls, catalog } = makeClient();
+    await client.findAddableProducts('essential', EMAIL);
+    assert.equal(catalog.requests.length, 1);
+    // Every allowlisted variant in that one call
+    assert.equal(catalog.requests[0].body.params.arguments.catalog.ids.length, ADDABLE.size);
+    await client.findAddableProducts('protein', EMAIL);
+    assert.equal(catalog.requests.length, 1);
+    assert.ok(!calls.some(call => call.endpoint.startsWith('/products')));
   });
 
   test('a rate limit becomes a hand-off, not a raw API error', async () => {
-    const { client } = makeClient({ overrides: { 'GET /products/:id': () => { throw new RechargeAPIError('Too Many Requests', 429); } } });
+    const { client } = makeClient({ catalog: makeCatalog({ respond: () => new Response('Too Many Requests', { status: 429 }) }) });
     const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /could not be looked up right now.*hand off to a support agent/);
@@ -920,6 +1045,497 @@ describe('write-failure logging', () => {
     const line = captured.find(item => item.includes('Verified write failed'));
     assert.match(line, /status 422: next_charge_scheduled_at is invalid for <email>/);
     assert.ok(captured.every(item => !item.includes(EMAIL)));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shopify storefront catalog (UCP)
+// ---------------------------------------------------------------------------
+
+const withCountry = (country, addressIds = [501, 502]) => {
+  const db = fixtures();
+  for (const address of db.addresses) {
+    if (addressIds.includes(address.id)) {
+      address.country_code = country;
+    }
+  }
+  return db;
+};
+
+describe('catalog client', () => {
+  test('a lookup sends lookup_catalog with the agent profile, gids and country', async () => {
+    const catalog = makeCatalog();
+    const variants = await catalog.lookupVariants(['8001', NATALBIOTIC.variantId, '999'], 'CA');
+    const { url, init, body } = catalog.requests[0];
+    assert.equal(url, UCP_URL);
+    assert.equal(init.method, 'POST');
+    assert.equal(init.headers['Content-Type'], 'application/json');
+    assert.equal(init.headers.Accept, 'application/json, text/event-stream');
+    assert.equal(init.redirect, 'error');
+    assert.equal(body.method, 'tools/call');
+    assert.equal(body.params.name, 'lookup_catalog');
+    assert.deepEqual(body.params.arguments, {
+      meta: { 'ucp-agent': { profile: PROFILE_URL } },
+      catalog: { ids: [variantGid('8001'), variantGid(NATALBIOTIC.variantId), variantGid('999')], context: { address_country: 'CA' } },
+    });
+    assert.deepEqual(variants.get(NATALBIOTIC.variantId), {
+      productId: NATALBIOTIC.productId, productTitle: 'Natalbiotic™', variantTitle: 'Default Title',
+      unitPrice: 106.82, currency: 'CAD', available: true,
+    });
+    // Not-found IDs are absent; other variants of a returned product are not added
+    assert.deepEqual([...variants.keys()].sort(), ['42144416137310', '8001']);
+    assert.ok(!JSON.stringify([...variants.values()]).includes(DESCRIPTION_MARKER));
+  });
+
+  test('the trimmed live response (content text only, no structuredContent) parses', async () => {
+    const catalog = makeCatalog({ respond: () => jsonResponse(LIVE_LOOKUP_CA) });
+    const variants = await catalog.lookupVariants([NATALBIOTIC.variantId, '42283036246110', '99999999999999'], 'CA');
+    assert.equal(variants.get(NATALBIOTIC.variantId).unitPrice, 106.82);
+    assert.equal(variants.get('42283036246110').unitPrice, 56.82);
+    assert.equal(variants.get('42283036246110').productId, '7482572570718');
+    assert.equal(variants.has('99999999999999'), false);
+  });
+
+  test('an SSE-formatted body is parsed', async () => {
+    const catalog = makeCatalog({
+      respond: () => new Response(`event: message\ndata: ${JSON.stringify(LIVE_LOOKUP_CA)}\n\n`, {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      }),
+    });
+    const variants = await catalog.lookupVariants([NATALBIOTIC.variantId], 'CA');
+    assert.equal(variants.get(NATALBIOTIC.variantId).currency, 'CAD');
+  });
+
+  test('only exact matches on the requested ID count', async () => {
+    const catalog = makeCatalog({
+      respond: body => {
+        const product = ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', 3300, 'USD')]);
+        product.variants[0].inputs = [{ id: variantGid('8001'), match: 'fuzzy' }];
+        return jsonResponse(rpcResult(body.id, { products: [product], messages: [] }));
+      },
+    });
+    assert.equal((await catalog.lookupVariants(['8001'], 'US')).size, 0);
+  });
+
+  test('more than 50 IDs are split into chunks', async () => {
+    const catalog = makeCatalog();
+    const ids = Array.from({ length: 120 }, (_, index) => String(10000 + index));
+    await catalog.lookupVariants(ids, 'US');
+    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.ids.length), [50, 50, 20]);
+  });
+
+  const failures = [
+    ['a JSON-RPC error', () => jsonResponse({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'UCP discovery failed', data: { code: 'profile_malformed' } } }), 'profile_malformed'],
+    ['isError', body => jsonResponse({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: 'nope' }], isError: true } }), 'tool_error'],
+    ['HTTP 503', () => new Response('unavailable', { status: 503 }), 'http_error'],
+    ['an unparseable body', () => new Response('<html>oops</html>', { status: 200 }), 'unparseable'],
+    ['a result with no products', body => jsonResponse(rpcResult(body.id, { messages: [] })), 'unparseable'],
+    ['a transport error', () => { throw new TypeError('fetch failed'); }, 'network_error'],
+  ];
+  for (const [label, respond, code] of failures) {
+    test(`${label} throws (${code})`, async () => {
+      const catalog = makeCatalog({ respond });
+      await assert.rejects(catalog.lookupVariants(['8001'], 'US'), error => {
+        assert.equal(error.code, code);
+        return true;
+      });
+    });
+  }
+
+  test('a slow catalog times out', async () => {
+    const catalog = makeCatalog({
+      timeoutMs: 20,
+      respond: (body, init) => new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      }),
+    });
+    await assert.rejects(catalog.lookupVariants(['8001'], 'US'), error => error.code === 'timeout');
+  });
+
+  test('country must be ISO alpha-2 uppercase and IDs digits, before any request', async () => {
+    const catalog = makeCatalog();
+    for (const country of ['us', 'USA', '', undefined, 'U1']) {
+      await assert.rejects(catalog.lookupVariants(['8001'], country), error => error.code === 'invalid_country');
+    }
+    await assert.rejects(catalog.lookupVariants(['80/01'], 'US'), error => error.code === 'invalid_id');
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test('a redirect is never followed', async () => {
+    // Behaves like fetch: follows a redirect to an http:// host unless told not to
+    const catalog = makeCatalog({
+      respond: (body, init) => {
+        if (init.redirect !== 'error') {
+          return jsonResponse(rpcResult(body.id, { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 99, 'USD')])], messages: [] }));
+        }
+        throw new TypeError('fetch failed: unexpected redirect');
+      },
+    });
+    await assert.rejects(catalog.lookupVariants(['8001'], 'US'), error => error.code === 'network_error');
+    // A 3xx that reaches the client (redirect: 'manual' style) is not ok either
+    const manual = makeCatalog({ respond: () => new Response(null, { status: 307, headers: { location: 'http://evil.example.com/' } }) });
+    await assert.rejects(manual.lookupVariants(['8001'], 'US'), error => error.code === 'http_error' && error.statusCode === 307);
+  });
+
+  test('a JSON-RPC error code is only kept when it is a short plain token', async () => {
+    for (const [data, expected] of [
+      [{ code: 'profile_malformed' }, 'profile_malformed'],
+      [{ code: { nested: true } }, 'rpc_error'],
+      [{ code: `x${'y'.repeat(100)}` }, 'rpc_error'],
+      [{ code: 'has spaces and <html>' }, 'rpc_error'],
+      [undefined, '-32001'],
+    ]) {
+      const catalog = makeCatalog({ respond: () => jsonResponse({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'UCP discovery failed', data } }) });
+      await assert.rejects(catalog.lookupVariants(['8001'], 'US'), error => {
+        assert.equal(error.code, expected);
+        assert.ok(error.message.length < 120);
+        return true;
+      });
+    }
+  });
+
+  test('a warning or error message fails the lookup; info messages do not', async () => {
+    const products = [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 3300, 'USD')])];
+    for (const messages of [
+      [{ type: 'warning', code: 'market_fallback', content: 'priced from the default market' }],
+      [{ type: 'error', code: 'pricing_unavailable', content: variantGid('8001') }],
+      [null],
+      'oops',
+    ]) {
+      const catalog = makeCatalog({ respond: body => jsonResponse(rpcResult(body.id, { products, messages })) });
+      await assert.rejects(catalog.lookupVariants(['8001'], 'US'), error => error.code === 'catalog_message', JSON.stringify(messages));
+    }
+    for (const messages of [[{ type: 'info', code: 'not_found', content: variantGid('999') }], [], undefined]) {
+      const catalog = makeCatalog({ respond: body => jsonResponse(rpcResult(body.id, { products, messages })) });
+      assert.equal((await catalog.lookupVariants(['8001', '999'], 'US')).get('8001').unitPrice, 33);
+    }
+  });
+
+  test('structuredContent wins over the text copy', async () => {
+    const catalog = makeCatalog({
+      respond: body => {
+        const structured = { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 3300, 'USD')])], messages: [] };
+        const text = { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 1, 'USD')])], messages: [] };
+        return jsonResponse({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: JSON.stringify(text) }], structuredContent: structured, isError: false } });
+      },
+    });
+    assert.equal((await catalog.lookupVariants(['8001'], 'US')).get('8001').unitPrice, 33);
+  });
+
+  test('a variant returned under two products is ambiguous and dropped', async () => {
+    const respond = body => jsonResponse(rpcResult(body.id, {
+      products: [
+        ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', 3300, 'USD'), ucpVariant('8006', '60 count', 6000, 'USD')]),
+        ucpProduct('7007', 'Gummies', 'g', [ucpVariant('8001', '30 count', 100, 'USD')]),
+      ],
+      messages: [],
+    }));
+    const variants = await makeCatalog({ respond }).lookupVariants(['8001', '8006'], 'US');
+    assert.deepEqual([...variants.keys()], ['8006']);
+    const { client, calls } = makeClient({ catalog: makeCatalog({ respond }) });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /That product can't be added here/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('a non-integer, negative or string amount is never a price', async () => {
+    for (const amount of [68.18, '6818', -1, null, Number.MAX_SAFE_INTEGER + 2]) {
+      const respond = body => jsonResponse(rpcResult(body.id, {
+        products: [ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', amount, 'USD')])], messages: [],
+      }));
+      const variant = (await makeCatalog({ respond }).lookupVariants(['8001'], 'US')).get('8001');
+      assert.ok(Number.isNaN(variant.unitPrice), String(amount));
+      const { client, calls } = makeClient({ catalog: makeCatalog({ respond }) });
+      await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /That product can't be added here/);
+      assert.equal(writes(calls).length, 0, String(amount));
+      assert.deepEqual((await client.findAddableProducts('30 count', EMAIL)).products, [], String(amount));
+    }
+  });
+
+  test('fraction digits come from the currency (JPY 0, KWD 3, unknown currency NaN)', async () => {
+    const respond = body => jsonResponse(rpcResult(body.id, {
+      products: [
+        ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 1000, 'JPY'), ucpVariant('8006', '60 count', 12345, 'KWD')]),
+        ucpProduct('7005', 'P', 'p', [ucpVariant('8007', 'Chocolate', 3300, 'XYZ1')]),
+      ],
+      messages: [],
+    }));
+    const variants = await makeCatalog({ respond }).lookupVariants(['8001', '8006', '8007'], 'JP');
+    assert.equal(variants.get('8001').unitPrice, 1000);
+    assert.equal(variants.get('8006').unitPrice, 12.345);
+    assert.ok(Number.isNaN(variants.get('8007').unitPrice));
+  });
+
+  test('MCP_SHOPIFY_UCP_URL and MCP_UCP_AGENT_PROFILE must both be https URLs', () => {
+    assert.deepEqual(parseShopifyCatalogConfig(undefined, ''), { config: null, warnings: [] });
+    assert.deepEqual(parseShopifyCatalogConfig(UCP_URL, PROFILE_URL), { config: { endpoint: UCP_URL, profileUrl: PROFILE_URL }, warnings: [] });
+    for (const [endpoint, profile, pattern] of [
+      ['http://shop.example.com/api/ucp/mcp', PROFILE_URL, /MCP_SHOPIFY_UCP_URL must be an https URL/],
+      [UCP_URL, 'not a url', /MCP_UCP_AGENT_PROFILE must be an https URL/],
+      ['https://user:pw@shop.example.com/mcp', PROFILE_URL, /MCP_SHOPIFY_UCP_URL must be an https URL/],
+      [UCP_URL, undefined, /MCP_UCP_AGENT_PROFILE is not set/],
+    ]) {
+      const parsed = parseShopifyCatalogConfig(endpoint, profile);
+      assert.equal(parsed.config, null);
+      assert.match(parsed.warnings.join(' '), pattern);
+      assert.ok(!parsed.warnings.join(' ').includes('pw@'));
+    }
+  });
+});
+
+describe('adds priced from the Shopify catalog', () => {
+  test('a CA address looks up with CA context and is checked against the CAD price', async () => {
+    const { client, calls, catalog } = makeClient({
+      db: withCountry('CA'),
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '106.82', presentment_currency: 'CAD' } }) },
+    });
+    const result = await client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL);
+    assert.equal(result.onetime.price, '106.82');
+    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog), [
+      { ids: [variantGid(NATALBIOTIC.variantId)], context: { address_country: 'CA' } },
+    ]);
+    assert.deepEqual(writes(calls)[0].data.external_product_id, { ecommerce: NATALBIOTIC.productId });
+  });
+
+  test('the same price on a US address is above the USD catalog price, so it is removed again', async () => {
+    const { client, calls } = makeClient({
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '106.82', presentment_currency: 'USD' } }) },
+    });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL), /removed again/);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
+  });
+
+  test('a CA subscription at the 12% plan price is accepted', async () => {
+    const db = withCountry('CA');
+    const { client, calls } = makeClient({
+      db,
+      overrides: { 'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, ...data, price: '94.00', presentment_currency: 'CAD' } }) },
+    });
+    await client.verifiedCreateSubscription(subscriptionArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /subscriptions']);
+    assert.equal(writes(calls)[0].data.plan_id, 4);
+  });
+
+  test('a product gid that differs from the allowlist is refused with no write', async () => {
+    const { client, calls } = makeClient();
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId: 8010 }), EMAIL), /That product can't be added here/);
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs({ variantId: 8010 }), EMAIL), /That product can't be added here/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('an unavailable variant is refused with no write', async () => {
+    const { client, calls } = makeClient();
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId: 8004 }), EMAIL), /That product can't be added here/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('an address with no usable country is refused before the catalog is read', async () => {
+    for (const country of [undefined, '', 'Canada']) {
+      const { client, calls, catalog } = makeClient({ db: withCountry(country) });
+      await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /That product can't be added here/);
+      assert.equal(writes(calls).length, 0);
+      assert.equal(catalog.requests.length, 0);
+    }
+  });
+
+  test('a catalog failure is a "could not be checked" refusal and nothing is posted', async () => {
+    for (const respond of [
+      () => { throw new TypeError('fetch failed'); },
+      () => jsonResponse({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'UCP discovery failed', data: { code: 'profile_malformed' } } }),
+    ]) {
+      const { client, calls } = makeClient({ catalog: makeCatalog({ respond }) });
+      await refusal(client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /could not be checked right now, so nothing was changed/);
+      assert.equal(writes(calls).length, 0);
+    }
+  });
+
+  test('write-time checks always read the catalog fresh', async () => {
+    const { client, catalog } = makeClient();
+    await client.findAddableProducts('essential', EMAIL);
+    await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
+    await client.verifiedCreateOnetime(onetimeArgs({ date: FUTURE_2 }), EMAIL);
+    assert.equal(catalog.requests.length, 3);
+  });
+
+  test('without a catalog nothing can be added or found', async () => {
+    const { client, calls } = makeClient({ catalog: null });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /That product can't be added here/);
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /That product can't be added here/);
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    assert.match(result.content[0].text, /Adding products isn't available here; hand off to a support agent/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('a created record in another currency is deleted again and refused', async () => {
+    const { client, calls } = makeClient({
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '33.00', presentment_currency: 'CAD' } }) },
+    });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /priced this item differently.*removed again/);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
+
+    const second = makeClient({
+      overrides: { 'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, ...data, price: '29.70', currency: 'GBP' } }) },
+    });
+    await refusal(second.client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /removed again/);
+    assert.deepEqual(writes(second.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /subscriptions', 'DELETE /subscriptions/1101']);
+  });
+
+  test('a lowercase country_code is used as the uppercase country', async () => {
+    const { client, catalog } = makeClient({
+      db: withCountry('ca'),
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '106.82', presentment_currency: 'CAD' } }) },
+    });
+    await client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL);
+    assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, 'CA');
+  });
+
+  test("a catalog price in another market's currency is refused with no write", async () => {
+    // A CA address priced in USD (e.g. a default-market fallback)
+    const catalogDb = catalogFixtures();
+    catalogDb.CA = catalogDb.US;
+    const { client, calls } = makeClient({ db: withCountry('CA'), catalog: makeCatalog({ db: catalogDb }) });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL), /That product can't be added here/);
+    assert.equal(writes(calls).length, 0);
+    assert.deepEqual((await client.findAddableProducts('natalbiotic', EMAIL)).products, []);
+  });
+
+  test('a created record naming no currency is only trusted against a USD catalog price', async () => {
+    // CA: the record's 68.18 could be USD under a 106.82 CAD ceiling, so it is removed again
+    const ca = makeClient({
+      db: withCountry('CA'),
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '68.18' } }) },
+    });
+    await refusal(ca.client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL), /removed again/);
+    assert.deepEqual(writes(ca.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
+
+    // US: no currency on the record, priced at the USD catalog price, is accepted
+    const us = makeClient({
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '68.18' } }) },
+    });
+    await us.client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL);
+    assert.deepEqual(writes(us.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes']);
+  });
+
+  test('an empty presentment_currency falls back to currency', async () => {
+    const { client, calls } = makeClient({
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '33.00', presentment_currency: '', currency: 'CAD' } }) },
+    });
+    await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /removed again/);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
+  });
+});
+
+describe('find_addable_product with the Shopify catalog', () => {
+  test("country comes from the customer's addresses: one shared country, otherwise US", async () => {
+    for (const [db, expected, currency, price] of [
+      [withCountry('CA'), 'CA', 'CAD', '45.00'],
+      [withCountry('CA', [501]), 'US', 'USD', '33.00'],
+      [fixtures(), 'US', 'USD', '33.00'],
+    ]) {
+      const { client, catalog, calls } = makeClient({ db });
+      const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+      assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, expected);
+      assert.deepEqual([first.unit_price, first.currency], [price, currency]);
+      assert.deepEqual(calls.find(call => call.endpoint === '/addresses').params, { customer_id: '100', limit: 250 });
+    }
+  });
+
+  test("only the customer's own addresses pick the country", async () => {
+    // alice's addresses are all CA; someone else's address (returned by the unfiltered list) is US
+    const db = withCountry('CA');
+    db.addresses.find(address => address.id === 601).country_code = 'US';
+    const { client, catalog } = makeClient({ db });
+    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, 'CA');
+    assert.deepEqual([first.unit_price, first.currency], ['45.00', 'CAD']);
+  });
+
+  test('without customer_email the US catalog is used and no customer is read', async () => {
+    const { client, catalog, calls } = makeClient({ db: withCountry('CA') });
+    for (const email of [undefined, '', '   ']) {
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: email, query: '30 count' });
+      assert.ok(!result.isError);
+      assert.match(result.content[0].text, /"currency": "USD"/);
+    }
+    assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, 'US');
+    assert.deepEqual(calls.filter(call => call.endpoint === '/customers' || call.endpoint === '/addresses'), []);
+  });
+
+  test('unit_price uses the currency minor-unit digits (JPY has none)', async () => {
+    const catalogDb = { JP: [ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', 1000, 'JPY')])] };
+    const { client } = makeClient({ db: withCountry('JP'), catalog: makeCatalog({ db: catalogDb }) });
+    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    assert.deepEqual([first.unit_price, first.currency], ['1000', 'JPY']);
+  });
+
+  test('the cache is per country', async () => {
+    const db = withCountry('CA');
+    const { client, catalog } = makeClient({ db });
+    await client.findAddableProducts('essential', EMAIL);
+    db.addresses[0].country_code = 'US';
+    db.addresses[1].country_code = 'US';
+    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('protein', EMAIL);
+    assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.context.address_country), ['CA', 'US']);
+  });
+
+  test('a variant missing from the catalog is skipped and the others are returned', async () => {
+    const catalogDb = catalogFixtures();
+    catalogDb.US[0].variants = catalogDb.US[0].variants.filter(variant => variant.id !== variantGid('8001'));
+    const { client } = makeClient({ catalog: makeCatalog({ db: catalogDb }) });
+    assert.deepEqual((await client.findAddableProducts('essential', EMAIL)).products.map(product => product.variant_id), [8006]);
+  });
+
+  test('descriptions never reach the tool output', async () => {
+    const { client } = makeClient();
+    for (const query of ['essential', 'natalbiotic', 'protein']) {
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query });
+      assert.ok(!result.isError, query);
+      assert.ok(!result.content[0].text.includes(DESCRIPTION_MARKER), query);
+      assert.doesNotMatch(result.content[0].text, /description|html|handle|sku/i, query);
+    }
+    const natalbiotic = await client.findAddableProducts('natalbiotic', EMAIL);
+    assert.deepEqual(natalbiotic.products, [{
+      variant_id: Number(NATALBIOTIC.variantId), title: 'Natalbiotic™', variant_title: 'Default Title',
+      unit_price: '68.18', currency: 'USD', can_subscribe: true,
+    }]);
+  });
+
+  test('a JSON-RPC error becomes the "could not be looked up" hand-off', async () => {
+    const { client } = makeClient({
+      catalog: makeCatalog({ respond: () => jsonResponse({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'UCP discovery failed', data: { code: 'profile_malformed' } } }) }),
+    });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /could not be looked up right now.*hand off to a support agent/);
+    assert.doesNotMatch(result.content[0].text, /UCP|profile_malformed/);
+  });
+
+  test('an unknown customer gets the customer-safe refusal, not a lookup', async () => {
+    const { client, catalog } = makeClient();
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: 'nobody@example.com', query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Customer not found.*hand off to a support agent/);
+    assert.equal(catalog.requests.length, 0);
+  });
+});
+
+describe('Recharge error messages', () => {
+  test('errors keyed by field produce a readable message, not "HTTP 422 Error"', () => {
+    const axiosError = {
+      message: 'Request failed with status code 422',
+      config: { url: '/products/7001', method: 'get' },
+      response: { status: 422, headers: {}, data: { errors: { platform: ['This API is not compatible with your platform'] } } },
+    };
+    assert.throws(() => handleAPIError(axiosError), error => {
+      assert.ok(error instanceof RechargeAPIError);
+      assert.equal(error.statusCode, 422);
+      assert.equal(error.message, 'platform: This API is not compatible with your platform');
+      return true;
+    });
+    const several = { ...axiosError, response: { ...axiosError.response, data: { errors: { quantity: ['is invalid', 'must be positive'], price: 'is not allowed' } } } };
+    assert.throws(() => handleAPIError(several), /quantity: is invalid, must be positive; price: is not allowed/);
+    const text = { ...axiosError, response: { ...axiosError.response, data: { errors: 'Platform not supported' } } };
+    assert.throws(() => handleAPIError(text), error => error.message === 'Platform not supported' && error.statusCode === 422);
   });
 });
 
@@ -1088,5 +1704,33 @@ describe('server (stdio)', () => {
       assert.match(stderr(), /entry "oops"/);
       assert.ok(!stderr().includes(FAKE_TOKEN));
     });
+  });
+
+  test('with a valid Shopify catalog, find_addable_product reaches it (unreachable here, so a hand-off)', async () => {
+    // Valid https config pointing nowhere: nothing leaves the machine
+    await withServer({
+      MCP_HOSTED_MODE: 'true', MCP_VERIFIED_ADDABLE_VARIANTS: '7001:8001',
+      MCP_SHOPIFY_UCP_URL: 'https://127.0.0.1:9/api/ucp/mcp', MCP_UCP_AGENT_PROFILE: PROFILE_URL,
+    }, async ({ request, stderr }) => {
+      const result = await callTool(request, 'find_addable_product', { customer_email: EMAIL, query: 'essential' });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /Products could not be looked up right now, so nothing can be added; hand off to a support agent/);
+      assert.doesNotMatch(result.content[0].text, /Adding products isn't available here/);
+      assert.doesNotMatch(stderr(), /MCP_SHOPIFY_UCP_URL|MCP_UCP_AGENT_PROFILE|adding products is disabled/);
+    });
+  });
+
+  test('without a valid Shopify catalog, startup warns and adds are unavailable', async () => {
+    const cases = [
+      [{}, /MCP_VERIFIED_ADDABLE_VARIANTS is set but MCP_SHOPIFY_UCP_URL and MCP_UCP_AGENT_PROFILE are not; adding products is disabled/],
+      [{ MCP_SHOPIFY_UCP_URL: 'http://127.0.0.1:9/api/ucp/mcp', MCP_UCP_AGENT_PROFILE: PROFILE_URL }, /MCP_SHOPIFY_UCP_URL must be an https URL; adding products is disabled/],
+    ];
+    for (const [env, pattern] of cases) {
+      await withServer({ MCP_HOSTED_MODE: 'true', MCP_VERIFIED_ADDABLE_VARIANTS: '7001:8001', ...env }, async ({ request, stderr }) => {
+        const result = await callTool(request, 'find_addable_product', { customer_email: EMAIL, query: 'essential' });
+        assert.match(result.content[0].text, /Adding products isn't available here; hand off to a support agent/);
+        assert.match(stderr(), pattern);
+      });
+    }
   });
 });
