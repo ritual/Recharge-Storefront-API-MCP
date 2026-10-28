@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { handleAPIError } from './utils/error-handler.js';
 import { SessionCache } from './utils/session-cache.js';
+import { DEFAULT_VERIFIED_MAX_QUANTITY } from './utils/verified-writes.js';
 
 /**
  * Resource IDs are interpolated into endpoint paths, so reject anything that
@@ -14,11 +15,59 @@ function assertSafeEndpoint(endpoint) {
 }
 
 const VERIFIED_HANDOFF = 'hand off to a support agent';
+const VERIFIED_INTERVAL_UNITS = ['day', 'week', 'month'];
+// Subscription line properties that mark a gift or promotional line (e.g. _gwp)
+const VERIFIED_GIFT_PROPERTY = /^_*(gwp|gift|free|promo)/i;
+// find_addable_product caches catalog reads per process; write-time checks always read fresh
+const ADDABLE_PRODUCT_CACHE_TTL_MS = 60 * 1000;
+const addableProductCache = new Map();
 
-function verifiedWriteRefusal(message) {
-  return new Error(message.includes(VERIFIED_HANDOFF)
+/**
+ * Recharge 2021-11 returns external IDs as { ecommerce: "123" } on purchase
+ * items and as plain strings on catalog records; compare them as strings.
+ */
+function externalId(value) {
+  const id = value && typeof value === 'object' ? value.ecommerce : value;
+  return id === undefined || id === null ? '' : String(id).trim();
+}
+
+function chargeDate(value) {
+  return typeof value === 'string' ? value.slice(0, 10) : '';
+}
+
+/**
+ * The latest calendar date anywhere (UTC+14). Added items only join charges
+ * dated after it, so whatever the store's timezone, a charge due today (which
+ * Recharge may be processing) is never joined.
+ */
+function latestTodayAnywhere(now = Date.now()) {
+  return new Date(now + 14 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+/**
+ * Recharge sends prices as strings; missing or unreadable is NaN, never 0.
+ */
+function money(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return NaN;
+  }
+  return Number(value);
+}
+
+/**
+ * Lowercased whole words of a product title or query, for word matching.
+ */
+function titleWords(text) {
+  return String(text || '').toLowerCase().split(/[^a-z0-9+]+/).filter(Boolean);
+}
+
+export function verifiedWriteRefusal(message) {
+  const error = new Error(message.includes(VERIFIED_HANDOFF)
     ? message
     : `${message} Do not ask the customer for account IDs or tokens; ${VERIFIED_HANDOFF}.`);
+  // Marks a customer-safe refusal, so pre-write checks pass it through unchanged
+  error.verifiedRefusal = true;
+  return error;
 }
 
 /**
@@ -27,7 +76,14 @@ function verifiedWriteRefusal(message) {
  * Last updated: 2024-12-24
  */
 export class RechargeClient {
-  constructor({ storeUrl, sessionToken = null, adminToken = null, verifiedAdminWrites = false }) {
+  constructor({
+    storeUrl,
+    sessionToken = null,
+    adminToken = null,
+    verifiedAdminWrites = false,
+    verifiedMaxQuantity = DEFAULT_VERIFIED_MAX_QUANTITY,
+    addableVariants = new Map(),
+  }) {
     if (!storeUrl) {
       throw new Error('Store URL is required');
     }
@@ -71,6 +127,9 @@ export class RechargeClient {
     this.sessionToken = sessionToken;
     this.adminToken = adminToken;
     this.verifiedAdminWrites = verifiedAdminWrites === true;
+    this.verifiedMaxQuantity = verifiedMaxQuantity;
+    // Shopify variant ID -> Shopify product ID that verified writes may add
+    this.addableVariants = addableVariants instanceof Map ? addableVariants : new Map();
     this.sessionCache = new SessionCache();
     this.currentDomain = domain; // Store current domain for cache management
 
@@ -1387,5 +1446,609 @@ export class RechargeClient {
     return await this.makeAdminRequest('POST', `/charges/${charge.id}/skip`, {
       purchase_item_ids: purchaseItemIds.map(itemId => chargeItems.get(String(itemId))),
     });
+  }
+
+  /**
+   * Quantities set or added by verified writes must be whole numbers from 1
+   * to the configured cap (MCP_VERIFIED_MAX_QUANTITY).
+   */
+  assertVerifiedQuantity(quantity) {
+    const max = this.verifiedMaxQuantity;
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > max) {
+      throw verifiedWriteRefusal(
+        `Quantity must be a whole number from 1 to ${max} here, so no change was made. ` +
+        `If the customer wants a different quantity, ${VERIFIED_HANDOFF}.`
+      );
+    }
+    return quantity;
+  }
+
+  /**
+   * Run the reads that come before a verified write. Refusals pass through;
+   * any other failure (missing scope, rate limit, 5xx, an unexpected 4xx)
+   * becomes a refusal saying nothing was changed, so raw API errors never
+   * reach the assistant. Nothing has been written at this point.
+   */
+  async verifiedPreWriteChecks(checks) {
+    try {
+      return await checks();
+    } catch (error) {
+      if (error && error.verifiedRefusal) {
+        throw error;
+      }
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified pre-write check failed with status ${(error && error.statusCode) ?? 'unknown'}`);
+      }
+      throw verifiedWriteRefusal('This could not be checked right now, so nothing was changed.');
+    }
+  }
+
+  /**
+   * Load an address the customer owns that still ships something. 2021-11
+   * addresses have no status, so "active" means at least one active
+   * subscription on it; those subscriptions are returned for later checks.
+   */
+  async getVerifiedActiveAddress(addressId, customerId) {
+    const address = await this.getVerifiedOwnedResource('addresses', addressId, 'address', customerId, 'Address', 'get_addresses');
+    const activeSubscriptions = await this.getVerifiedActiveSubscriptions(address.id, customerId);
+    if (activeSubscriptions.length === 0) {
+      throw verifiedWriteRefusal(
+        `Address ${addressId} has no active subscription, so nothing can be added to it here and nothing was added.`
+      );
+    }
+    return { address, activeSubscriptions };
+  }
+
+  /**
+   * Active subscriptions on an address, keeping only records that belong to
+   * the customer whatever the list call returns.
+   */
+  async getVerifiedActiveSubscriptions(addressId, customerId) {
+    const response = await this.makeAdminRequest('GET', '/subscriptions', null, {
+      address_id: addressId,
+      status: 'active',
+      limit: 250,
+    });
+    return ((response && response.subscriptions) || []).filter(subscription =>
+      String(subscription.customer_id) === String(customerId) &&
+      String(subscription.address_id) === String(addressId) &&
+      String(subscription.status || '').toLowerCase() === 'active'
+    );
+  }
+
+  /**
+   * Live one-time items on an address the customer owns. Filtered here by
+   * address only (no external_variant_id query filter, which is not
+   * confirmed for 2021-11); customer_id is checked only when Recharge sends
+   * it. More than one page fails closed rather than missing an item.
+   */
+  async getVerifiedOnetimes(addressId, customerId) {
+    const response = await this.makeAdminRequest('GET', '/onetimes', null, {
+      address_id: addressId,
+      limit: 250,
+    });
+    const onetimes = (response && response.onetimes) || [];
+    if ((response && response.next_cursor) || onetimes.length >= 250) {
+      throw verifiedWriteRefusal('There are too many one-time items on this address to check, so nothing was changed.');
+    }
+    return onetimes.filter(onetime =>
+      String(onetime.address_id) === String(addressId) &&
+      (onetime.customer_id === undefined || onetime.customer_id === null || String(onetime.customer_id) === String(customerId)) &&
+      !onetime.cancelled_at &&
+      String(onetime.status || '').toLowerCase() !== 'cancelled'
+    );
+  }
+
+  /**
+   * The quantity cap applies per order, not per call: units of the variant
+   * already due on that date (active subscriptions and one-time items) plus
+   * the new quantity must stay within it.
+   */
+  assertVerifiedOrderUnits({ variantId, date, quantity, subscriptions, onetimes, excludeSubscriptionId = null }) {
+    const due = item => externalId(item.external_variant_id) === variantId &&
+      chargeDate(item.next_charge_scheduled_at) === date;
+    const existing =
+      subscriptions
+        .filter(subscription => due(subscription) && String(subscription.id) !== String(excludeSubscriptionId))
+        .reduce((sum, subscription) => sum + (Number(subscription.quantity) || 0), 0) +
+      onetimes.filter(due).reduce((sum, onetime) => sum + (Number(onetime.quantity) || 0), 0);
+    const max = this.verifiedMaxQuantity;
+    if (existing + quantity > max) {
+      throw verifiedWriteRefusal(
+        `The ${date} order already has ${existing} of that product, and no more than ${max} in one order can be set here, so no change was made. ` +
+        `If the customer wants more, ${VERIFIED_HANDOFF}.`
+      );
+    }
+  }
+
+  /**
+   * Upcoming queued charge dates on an address. Added items always join one
+   * of these. Only charges dated after today everywhere (UTC+14) count, so a
+   * charge Recharge may already be processing in the store's timezone is
+   * never joined.
+   */
+  async getVerifiedQueuedChargeDates(addressId, customerId) {
+    const response = await this.makeAdminRequest('GET', '/charges', null, {
+      address_id: addressId,
+      status: 'queued',
+      sort_by: 'scheduled_at-asc',
+      limit: 250,
+    });
+    const after = latestTodayAnywhere();
+    const queuedDates = [...new Set(((response && response.charges) || [])
+      .filter(charge =>
+        String(charge.customer?.id ?? charge.customer_id) === String(customerId) &&
+        String(charge.address_id) === String(addressId) &&
+        String(charge.status || '').toLowerCase() === 'queued' &&
+        chargeDate(charge.scheduled_at) > after
+      )
+      .map(charge => chargeDate(charge.scheduled_at)))]
+      .sort();
+
+    if (queuedDates.length === 0) {
+      throw verifiedWriteRefusal(
+        `There is no upcoming order on address ${addressId} that can still be added to, so nothing was added.`
+      );
+    }
+    return queuedDates;
+  }
+
+  /**
+   * The requested date must be the date of one of this customer's upcoming
+   * queued charges on the address. Returns that charge's own date (YYYY-MM-DD).
+   */
+  async getVerifiedQueuedChargeDate(addressId, customerId, date) {
+    const queuedDates = await this.getVerifiedQueuedChargeDates(addressId, customerId);
+    const requested = chargeDate(date);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || !queuedDates.includes(requested)) {
+      throw verifiedWriteRefusal(
+        `${date || 'The requested date'} is not the date of an upcoming order on this address that can still be added to, so nothing was added. ` +
+        `Upcoming order dates: ${queuedDates.join(', ')}. Ask the customer which of these orders they mean; ` +
+        `if it is none of them, ${VERIFIED_HANDOFF}.`
+      );
+    }
+
+    return queuedDates.find(queued => queued === requested);
+  }
+
+  /**
+   * Active subscription plans for a catalog product that cover the variant.
+   * Recharge needs at least one before the product can be subscribed to.
+   */
+  async getVerifiedSubscriptionPlans(productId, variantId) {
+    const response = await this.makeAdminRequest('GET', '/plans', null, {
+      external_product_id: productId,
+      type: 'subscription',
+    });
+    return ((response && response.plans) || []).filter(plan =>
+      String(plan.type || '').toLowerCase() === 'subscription' &&
+      (plan.deleted_at === null || plan.deleted_at === undefined) &&
+      (plan.external_product_id === undefined || externalId(plan.external_product_id) === productId) &&
+      (!plan.has_variant_restrictions ||
+        (Array.isArray(plan.external_variant_ids) && plan.external_variant_ids.map(externalId).includes(variantId)))
+    );
+  }
+
+  /**
+   * Load an allowlisted variant from the admin catalog. Not-allowlisted,
+   * missing, unpublished, unpriced and not-subscribable all get the same
+   * refusal. Everything returned comes from the catalog record, never the caller.
+   */
+  async getVerifiedAddableVariant(variantId, planType) {
+    const refusal = verifiedWriteRefusal(
+      `That product can't be added here, so nothing was added. ` +
+      `Use find_addable_product to look up the product the customer named; if it is not found, ${VERIFIED_HANDOFF}.`
+    );
+    const requested = String(variantId ?? '').trim();
+    const productId = this.addableVariants.get(requested);
+    if (!productId) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: variant ${requested} is not addable`);
+      }
+      throw refusal;
+    }
+
+    let response;
+    try {
+      response = await this.makeAdminRequest('GET', `/products/${productId}`);
+    } catch (error) {
+      if (error.statusCode === 404) {
+        throw refusal;
+      }
+      throw error;
+    }
+
+    const product = response && response.product;
+    const variant = product && Array.isArray(product.variants)
+      ? product.variants.find(item => externalId(item.external_variant_id) === requested)
+      : undefined;
+    const publishedAt = product ? Date.parse(product.published_at || '') : NaN;
+    if (!product || (product.external_product_id !== undefined && externalId(product.external_product_id) !== productId) ||
+        !variant || Number.isNaN(publishedAt) || publishedAt > Date.now()) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: variant ${requested} is not sellable in product ${productId}`);
+      }
+      throw refusal;
+    }
+
+    // A zero, missing or unreadable catalog price is never added (sample, gift or sync gap)
+    const unitPrice = money(variant.prices?.unit_price ?? variant.price);
+    if (!(unitPrice > 0)) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: variant ${requested} has no positive catalog price`);
+      }
+      throw refusal;
+    }
+
+    let plans = [];
+    if (planType === 'subscription') {
+      plans = await this.getVerifiedSubscriptionPlans(productId, requested);
+      if (plans.length === 0) {
+        if (process.env.DEBUG === 'true') {
+          console.error(`[DEBUG] Verified add refused: variant ${requested} has no subscription plan`);
+        }
+        throw refusal;
+      }
+    }
+
+    return {
+      productId,
+      variantId: externalId(variant.external_variant_id),
+      title: product.title,
+      variantTitle: variant.title,
+      unitPrice,
+      plans,
+    };
+  }
+
+  /**
+   * Wrap an error from the write call itself. A 4xx means Recharge rejected
+   * the change; anything else (5xx, timeout, network) means the outcome is
+   * unknown, so the assistant must not retry and risk a duplicate.
+   */
+  verifiedWriteFailure(error) {
+    const status = error && error.statusCode;
+    if (process.env.DEBUG === 'true') {
+      // Recharge's validation message names fields, not people; strip anything email-shaped anyway
+      const reason = String((error && error.message) || '').replace(/[^\s@"']+@[^\s@"']+/g, '<email>').slice(0, 300);
+      console.error(`[DEBUG] Verified write failed with status ${status ?? 'unknown'}: ${reason}`);
+    }
+    if (status >= 400 && status < 500) {
+      return verifiedWriteRefusal('Recharge did not accept this change, so nothing was changed.');
+    }
+    return verifiedWriteRefusal(
+      `The change could not be confirmed, so it may or may not have been made. Do not retry; ${VERIFIED_HANDOFF} to check the account.`
+    );
+  }
+
+  async verifiedAdminWrite(method, endpoint, data, params = null) {
+    try {
+      return await this.makeAdminRequest(method, endpoint, data, params);
+    } catch (error) {
+      throw this.verifiedWriteFailure(error);
+    }
+  }
+
+  /**
+   * After an add, the price Recharge set must be positive and no more than
+   * the catalog list price the customer was told. Otherwise the record just
+   * created is deleted again and the add is refused; if that delete fails,
+   * the assistant is told the outcome is unknown. Only IDs are logged.
+   */
+  async verifiedCheckCreatedPrice(collection, key, response, addressId, catalogPrice) {
+    const record = response && response[key];
+    const price = money(record && record.price);
+    if (price > 0 && price <= catalogPrice + 0.005) {
+      return response;
+    }
+
+    const id = record && record.id;
+    if (process.env.DEBUG === 'true') {
+      console.error(`[DEBUG] Verified add on ${collection} ${id ?? 'unknown'} was priced outside the catalog price; removing it`);
+    }
+    let removed = false;
+    if (record && /^\d+$/.test(String(id ?? '')) && String(record.address_id) === String(addressId)) {
+      try {
+        await this.makeAdminRequest('DELETE', `/${collection}/${id}`);
+        removed = true;
+      } catch (error) {
+        if (process.env.DEBUG === 'true') {
+          console.error(`[DEBUG] Removing ${collection} ${id} failed with status ${error.statusCode ?? 'unknown'}`);
+        }
+      }
+    }
+    if (removed) {
+      throw verifiedWriteRefusal(
+        'Recharge priced this item differently from the catalog, so it was removed again and nothing was added.'
+      );
+    }
+    throw verifiedWriteRefusal(
+      `The item may have been added at a price that could not be confirmed. Do not retry; ${VERIFIED_HANDOFF} to check the order.`
+    );
+  }
+
+  async verifiedUpdateSubscriptionQuantity(subscriptionId, quantity, customerEmail) {
+    if (!subscriptionId) {
+      throw new Error('Subscription ID is required');
+    }
+    const id = this.assertVerifiedId(subscriptionId, 'Subscription', 'get_subscriptions');
+    this.assertVerifiedQuantity(quantity);
+
+    const { customerId, record } = await this.verifiedPreWriteChecks(async () => {
+      const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+      const owned = await this.getVerifiedOwnedResource('subscriptions', id, 'subscription', customerId, 'Subscription', 'get_subscriptions');
+
+      const status = String(owned.status || '').toLowerCase();
+      if (status !== 'active') {
+        throw verifiedWriteRefusal(`Subscription ${id} is ${status || 'not active'}, so its quantity can't be changed here and nothing was changed.`);
+      }
+      if (owned.is_prepaid) {
+        throw verifiedWriteRefusal(`Subscription ${id} is prepaid, so its quantity can't be changed here and nothing was changed.`);
+      }
+      // Free, gift and promotional lines (zero or missing price, or a gift property such as _gwp) are never multiplied
+      const giftLine = Array.isArray(owned.properties) &&
+        owned.properties.some(property => VERIFIED_GIFT_PROPERTY.test(String((property && (property.name ?? property.key)) || '')));
+      if (!(money(owned.price) > 0) || giftLine) {
+        throw verifiedWriteRefusal(`Subscription ${id} is a gift or has a special price, so its quantity can't be changed here and nothing was changed.`);
+      }
+
+      // Raising the quantity must keep that product within the cap on the next order
+      const nextDate = chargeDate(owned.next_charge_scheduled_at);
+      if (quantity > Number(owned.quantity) && nextDate && owned.address_id) {
+        this.assertVerifiedOrderUnits({
+          variantId: externalId(owned.external_variant_id),
+          date: nextDate,
+          quantity,
+          subscriptions: await this.getVerifiedActiveSubscriptions(owned.address_id, customerId),
+          onetimes: await this.getVerifiedOnetimes(owned.address_id, customerId),
+          excludeSubscriptionId: owned.id,
+        });
+      }
+      return { customerId, record: owned };
+    });
+
+    if (Number(record.quantity) === quantity) {
+      return {
+        subscription: record,
+        previous_quantity: record.quantity,
+        result: `The quantity is already ${quantity}, so no change was made.`,
+      };
+    }
+
+    // No force_update, so Recharge itself only updates an active subscription;
+    // commit=true regenerates the queued charge before responding
+    const response = await this.verifiedAdminWrite('PUT', `/subscriptions/${record.id}`, { quantity }, { commit: true });
+    if (process.env.DEBUG === 'true') {
+      console.error(`[DEBUG] Verified quantity change on subscription ${record.id} for customer ${customerId}`);
+    }
+    return { ...response, previous_quantity: record.quantity };
+  }
+
+  async verifiedCreateOnetime({ addressId, variantId, quantity, date }, customerEmail) {
+    if (addressId === undefined || addressId === null || addressId === '') {
+      throw verifiedWriteRefusal(
+        `An address_id is needed to add an item to an upcoming order, so nothing was added. ` +
+        `Use get_addresses to find it; if the customer has more than one, ask which one.`
+      );
+    }
+    const id = this.assertVerifiedId(addressId, 'Address', 'get_addresses');
+    const requestedVariant = this.assertVerifiedId(variantId, 'Product variant', 'find_addable_product');
+    this.assertVerifiedQuantity(quantity);
+
+    const { customerId, address, scheduledAt, variant } = await this.verifiedPreWriteChecks(async () => {
+      const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+      const { address, activeSubscriptions } = await this.getVerifiedActiveAddress(id, customerId);
+      const scheduledAt = await this.getVerifiedQueuedChargeDate(address.id, customerId, date);
+      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'onetime');
+
+      const onetimes = await this.getVerifiedOnetimes(address.id, customerId);
+      if (onetimes.some(onetime =>
+        externalId(onetime.external_variant_id) === variant.variantId &&
+        chargeDate(onetime.next_charge_scheduled_at) === scheduledAt)) {
+        throw verifiedWriteRefusal(`That product is already on the ${scheduledAt} order, so nothing was added.`);
+      }
+      this.assertVerifiedOrderUnits({
+        variantId: variant.variantId,
+        date: scheduledAt,
+        quantity,
+        subscriptions: activeSubscriptions,
+        onetimes,
+      });
+      return { customerId, address, scheduledAt, variant };
+    });
+
+    // Recharge prices the item from the catalog: never send price, properties or titles.
+    // There is no lock between the checks above and this write (see README).
+    const response = await this.verifiedAdminWrite('POST', '/onetimes', {
+      address_id: address.id,
+      external_product_id: { ecommerce: variant.productId },
+      external_variant_id: { ecommerce: variant.variantId },
+      quantity,
+      next_charge_scheduled_at: scheduledAt,
+    });
+    if (process.env.DEBUG === 'true') {
+      console.error(`[DEBUG] Verified one-time add of variant ${variant.variantId} on address ${address.id} for customer ${customerId}`);
+    }
+    return await this.verifiedCheckCreatedPrice('onetimes', 'onetime', response, address.id, variant.unitPrice);
+  }
+
+  async verifiedCreateSubscription({ addressId, variantId, quantity, date, orderIntervalFrequency, orderIntervalUnit }, customerEmail) {
+    if (addressId === undefined || addressId === null || addressId === '') {
+      throw verifiedWriteRefusal(
+        `An address_id is needed to add a subscription, so nothing was added. ` +
+        `Use get_addresses to find it; if the customer has more than one, ask which one.`
+      );
+    }
+    const id = this.assertVerifiedId(addressId, 'Address', 'get_addresses');
+    const requestedVariant = this.assertVerifiedId(variantId, 'Product variant', 'find_addable_product');
+    this.assertVerifiedQuantity(quantity);
+
+    const { customerId, address, scheduledAt, variant, matched, plan } = await this.verifiedPreWriteChecks(async () => {
+      const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+      const { address, activeSubscriptions } = await this.getVerifiedActiveAddress(id, customerId);
+      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'subscription');
+
+      if (activeSubscriptions.some(subscription => externalId(subscription.external_variant_id) === variant.variantId)) {
+        throw verifiedWriteRefusal(
+          `The customer already has an active subscription for that product at this address, so nothing was added. ` +
+          `To send more of it, change that subscription's quantity with update_subscription instead.`
+        );
+      }
+
+      // The new item must ship with an existing (non-prepaid) subscription here: same interval...
+      const unit = String(orderIntervalUnit || '').toLowerCase();
+      const sameInterval = VERIFIED_INTERVAL_UNITS.includes(unit) && Number.isInteger(orderIntervalFrequency)
+        ? activeSubscriptions.filter(subscription =>
+            !subscription.is_prepaid &&
+            String(subscription.order_interval_unit || '').toLowerCase() === unit &&
+            Number(subscription.order_interval_frequency) === orderIntervalFrequency)
+        : [];
+      if (sameInterval.length === 0) {
+        throw verifiedWriteRefusal(
+          `A new subscription here must match how often the customer's current subscription at this address ships, so nothing was added.`
+        );
+      }
+
+      // ...and the same next order, so it is anchored to that subscription's schedule
+      const scheduledAt = await this.getVerifiedQueuedChargeDate(address.id, customerId, date);
+      const matched = sameInterval.find(subscription => chargeDate(subscription.next_charge_scheduled_at) === scheduledAt);
+      if (!matched) {
+        const nextDates = [...new Set(sameInterval.map(subscription => chargeDate(subscription.next_charge_scheduled_at)).filter(Boolean))].sort();
+        throw verifiedWriteRefusal(
+          `A new subscription must start on the next order of the subscription it ships with, so nothing was added. ` +
+          `Subscriptions at this address on that schedule next ship on: ${nextDates.join(', ') || 'no upcoming date'}. ` +
+          `Ask the customer which order they mean; if it is none of them, ${VERIFIED_HANDOFF}.`
+        );
+      }
+
+      // The product must be offered on that interval by one of its subscription plans
+      const matchedUnit = String(matched.order_interval_unit || '').toLowerCase();
+      const matchedCharge = Number(matched.charge_interval_frequency ?? matched.order_interval_frequency);
+      const plan = variant.plans.find(item => {
+        const preferences = item.subscription_preferences || {};
+        return String(preferences.interval_unit || '').toLowerCase() === matchedUnit &&
+          Number(preferences.order_interval_frequency) === Number(matched.order_interval_frequency) &&
+          (preferences.charge_interval_frequency === undefined || preferences.charge_interval_frequency === null ||
+            Number(preferences.charge_interval_frequency) === matchedCharge);
+      });
+      if (!plan) {
+        throw verifiedWriteRefusal(
+          `That product isn't offered on the same schedule as the customer's current subscription at this address, so nothing was added.`
+        );
+      }
+
+      this.assertVerifiedOrderUnits({
+        variantId: variant.variantId,
+        date: scheduledAt,
+        quantity,
+        subscriptions: activeSubscriptions,
+        onetimes: await this.getVerifiedOnetimes(address.id, customerId),
+      });
+      return { customerId, address, scheduledAt, variant, matched, plan };
+    });
+
+    // Interval and plan come from verified records, never the raw input; no price, so Recharge
+    // prices it (plan_id lets the plan's subscription discount apply)
+    const subscriptionData = {
+      address_id: address.id,
+      external_product_id: { ecommerce: variant.productId },
+      external_variant_id: { ecommerce: variant.variantId },
+      quantity,
+      next_charge_scheduled_at: scheduledAt,
+      order_interval_unit: matched.order_interval_unit,
+      order_interval_frequency: matched.order_interval_frequency,
+      charge_interval_frequency: matched.charge_interval_frequency ?? matched.order_interval_frequency,
+      plan_id: plan.id,
+    };
+    if (matched.order_day_of_month !== undefined && matched.order_day_of_month !== null) {
+      subscriptionData.order_day_of_month = matched.order_day_of_month;
+    }
+    if (matched.order_day_of_week !== undefined && matched.order_day_of_week !== null) {
+      subscriptionData.order_day_of_week = matched.order_day_of_week;
+    }
+
+    const response = await this.verifiedAdminWrite('POST', '/subscriptions', subscriptionData);
+    if (process.env.DEBUG === 'true') {
+      console.error(`[DEBUG] Verified subscription add of variant ${variant.variantId} on address ${address.id} for customer ${customerId}`);
+    }
+    return await this.verifiedCheckCreatedPrice('subscriptions', 'subscription', response, address.id, variant.unitPrice);
+  }
+
+  /**
+   * Catalog product for find_addable_product, cached per process for a short
+   * time so a search doesn't re-read every allowlisted product. Write-time
+   * checks never use this cache.
+   */
+  async getCachedCatalogProduct(productId) {
+    const key = `${this.currentDomain}:${productId}`;
+    const cached = addableProductCache.get(key);
+    if (cached && Date.now() - cached.at < ADDABLE_PRODUCT_CACHE_TTL_MS) {
+      return cached.product;
+    }
+    let product = null;
+    try {
+      const response = await this.makeAdminRequest('GET', `/products/${productId}`);
+      product = (response && response.product) || null;
+    } catch (error) {
+      if (error.statusCode !== 404) {
+        throw error;
+      }
+    }
+    addableProductCache.set(key, { at: Date.now(), product });
+    return product;
+  }
+
+  /**
+   * Read-only lookup of allowlisted, currently published, priced variants
+   * whose product or variant title matches the query. Every query word must
+   * be a whole word of the title or the start of one ("men" never matches
+   * "women").
+   */
+  async findAddableProducts(query) {
+    const words = titleWords(query);
+    if (this.addableVariants.size === 0 || words.length === 0) {
+      return { products: [] };
+    }
+
+    const variantsByProduct = new Map();
+    for (const [variantId, productId] of this.addableVariants) {
+      variantsByProduct.set(productId, [...(variantsByProduct.get(productId) || []), variantId]);
+    }
+
+    const products = [];
+    for (const [productId, variantIds] of variantsByProduct) {
+      const product = await this.getCachedCatalogProduct(productId);
+      const publishedAt = product ? Date.parse(product.published_at || '') : NaN;
+      if (!product || !Array.isArray(product.variants) || Number.isNaN(publishedAt) || publishedAt > Date.now()) {
+        continue;
+      }
+
+      for (const variantId of variantIds) {
+        const variant = product.variants.find(item => externalId(item.external_variant_id) === variantId);
+        const unitPrice = variant ? money(variant.prices?.unit_price ?? variant.price) : NaN;
+        const titleTokens = titleWords(`${product.title || ''} ${variant ? variant.title || '' : ''}`);
+        if (!variant || !(unitPrice > 0) ||
+            !words.every(word => titleTokens.some(token => token === word || token.startsWith(word)))) {
+          continue;
+        }
+        let canSubscribe = false;
+        try {
+          canSubscribe = (await this.getVerifiedSubscriptionPlans(productId, variantId)).length > 0;
+        } catch (error) {
+          if (process.env.DEBUG === 'true') {
+            console.error(`[DEBUG] Plan lookup failed for product ${productId}:`, error.message);
+          }
+        }
+        products.push({
+          // A number, as create_onetime and create_subscription take it (allowlisted IDs are safe integers)
+          variant_id: Number(variantId),
+          title: product.title,
+          variant_title: variant.title,
+          unit_price: variant.prices?.unit_price ?? variant.price ?? null,
+          can_subscribe: canSubscribe,
+        });
+      }
+    }
+    return { products };
   }
 }

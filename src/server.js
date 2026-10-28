@@ -18,10 +18,19 @@ dotenv.config({ debug: debug, quiet: !debug });
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import * as z from 'zod';
-import { RechargeClient } from './recharge-client.js';
+import { RechargeClient, verifiedWriteRefusal } from './recharge-client.js';
 import { tools } from './tools/index.js';
 import { formatErrorResponse, validateAuthParams } from './utils/error-handler.js';
+import {
+  findDisallowedVerifiedArgs,
+  isVerifiedWriteCall,
+  listedDescription,
+  parseAddableVariants,
+  parseMaxQuantity,
+  toListedSchema,
+  verifiedArgsRefusalMessage,
+  verifiedSchemaRefusalMessage,
+} from './utils/verified-writes.js';
 
 /**
  * Server statistics tracking
@@ -47,8 +56,9 @@ const HOSTED_IDENTITY_ERRORS = /Customer not found with email|Multiple customers
 
 /**
  * Verified admin writes: email-minted storefront sessions are read-only, so
- * set_subscription_next_charge, skip_subscription, skip_charge and
- * update_address instead check (with the admin token) that the target belongs
+ * set_subscription_next_charge, skip_subscription, skip_charge,
+ * update_address, update_subscription (quantity only), create_onetime and
+ * create_subscription instead check (with the admin token) that the target belongs
  * to the customer identified by customer_email, then write with the admin
  * token. Only available in hosted mode, where customer_email comes from the
  * client's verified contact rather than the caller: on by default there, and
@@ -66,7 +76,24 @@ const verifiedAdminWritesIgnored = !hostedMode && process.env.MCP_VERIFIED_ADMIN
  * every client sends customer_email and hosted mode is on.
  */
 const verifiedAdminWritesTransitional = !hostedMode && process.env.MCP_VERIFIED_ADMIN_WRITES === 'transitional';
-const VERIFIED_WRITE_TOOLS = new Set(['set_subscription_next_charge', 'skip_subscription', 'update_address', 'skip_charge']);
+const VERIFIED_WRITE_TOOLS = new Set([
+  'set_subscription_next_charge',
+  'skip_subscription',
+  'update_address',
+  'skip_charge',
+  'update_subscription',
+  'create_onetime',
+  'create_subscription',
+]);
+
+/**
+ * Limits for verified quantity changes and added products. The quantity cap
+ * (MCP_VERIFIED_MAX_QUANTITY, 1-10, default 2) applies to both; only variants
+ * in MCP_VERIFIED_ADDABLE_VARIANTS (productId:variantId pairs) can be added,
+ * and an empty list means nothing can be added.
+ */
+const verifiedMaxQuantity = parseMaxQuantity(process.env.MCP_VERIFIED_MAX_QUANTITY);
+const addableVariants = parseAddableVariants(process.env.MCP_VERIFIED_ADDABLE_VARIANTS);
 
 /**
  * Tools hidden from listing and rejected on call (comma-separated names)
@@ -78,20 +105,12 @@ const toolDenylist = new Set(
     .filter(Boolean)
 );
 const exposedTools = tools.filter(tool => !toolDenylist.has(tool.name));
-
-function toListedSchema(inputSchema) {
-  const jsonSchema = z.toJSONSchema(inputSchema);
-  if (!hostedMode || !jsonSchema.properties) {
-    return jsonSchema;
-  }
-  for (const arg of HOSTED_STRIPPED_ARGS) {
-    delete jsonSchema.properties[arg];
-  }
-  if (Array.isArray(jsonSchema.required)) {
-    jsonSchema.required = jsonSchema.required.filter(arg => !HOSTED_STRIPPED_ARGS.includes(arg));
-  }
-  return jsonSchema;
-}
+const listingOptions = {
+  hostedMode,
+  verifiedAdminWrites,
+  strippedArgs: HOSTED_STRIPPED_ARGS,
+  maxQuantity: verifiedMaxQuantity.value,
+};
 
 /**
  * MCP Server instance
@@ -141,8 +160,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: exposedTools.map(tool => ({
       name: tool.name,
-      description: tool.description,
-      inputSchema: toListedSchema(tool.inputSchema),
+      description: listedDescription(tool, listingOptions),
+      inputSchema: toListedSchema(tool, listingOptions),
     })),
   };
 });
@@ -185,6 +204,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         delete rawArgs[arg];
       }
     }
+    // Decided on the raw arguments so disallowed fields are refused before Zod strips them
+    const verifiedWrite = isVerifiedWriteCall(name, rawArgs, {
+      verifiedTools: VERIFIED_WRITE_TOOLS,
+      verifiedAdminWrites,
+      transitional: verifiedAdminWritesTransitional,
+    });
+    if (verifiedWrite) {
+      const disallowed = findDisallowedVerifiedArgs(rawArgs, tool.verifiedArgs, HOSTED_STRIPPED_ARGS);
+      if (disallowed.length > 0) {
+        throw verifiedWriteRefusal(verifiedArgsRefusalMessage(tool, disallowed));
+      }
+    }
+    // Verified quantity and product tools refuse a schema failure in customer-safe text, not a raw Zod error
+    if (verifiedWrite && Array.isArray(tool.verifiedArgs)) {
+      const parsed = tool.inputSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw verifiedWriteRefusal(verifiedSchemaRefusalMessage(parsed.error, tool, rawArgs));
+      }
+    }
     const validatedArgs = tool.inputSchema.parse(rawArgs);
 
     if (hostedMode && !validatedArgs.customer_email) {
@@ -199,12 +237,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // In hosted mode every call must mint a session for the identified customer
     const sessionToken = hostedMode ? null : (validatedArgs.session_token || process.env.RECHARGE_SESSION_TOKEN);
     // Verified writes act with the server's own admin token only, never a caller-supplied one
-    const verifiedWrite = VERIFIED_WRITE_TOOLS.has(name) && (verifiedAdminWrites || (
-      verifiedAdminWritesTransitional &&
-      Boolean(validatedArgs.customer_email) &&
-      !validatedArgs.session_token &&
-      !validatedArgs.admin_token
-    ));
     const adminToken = verifiedWrite ? process.env.RECHARGE_ADMIN_TOKEN : (validatedArgs.admin_token || process.env.RECHARGE_ADMIN_TOKEN);
     
     // Validate required configuration
@@ -273,7 +305,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       storeUrl: domain,
       sessionToken,
       adminToken,
-      verifiedAdminWrites: verifiedWrite
+      verifiedAdminWrites: verifiedWrite,
+      verifiedMaxQuantity: verifiedMaxQuantity.value,
+      addableVariants: addableVariants.variants
     });
     
     // Track customer for statistics
@@ -406,6 +440,13 @@ async function main() {
       console.error('[WARNING] MCP_VERIFIED_ADMIN_WRITES=true is ignored without MCP_HOSTED_MODE=true (customer_email is only trusted in hosted mode)');
     }
     
+    if (verifiedMaxQuantity.warning) {
+      console.error(`[WARNING] ${verifiedMaxQuantity.warning}`);
+    }
+    for (const warning of addableVariants.warnings) {
+      console.error(`[WARNING] ${warning}`);
+    }
+    
     if (process.env.RECHARGE_ADMIN_TOKEN === 'your_admin_token_here') {
       console.error('[WARNING] Please update RECHARGE_ADMIN_TOKEN with your actual admin token');
     }
@@ -422,6 +463,7 @@ async function main() {
       console.error('[DEBUG] Store domain:', hasStoreDomain ? process.env.RECHARGE_STOREFRONT_DOMAIN : 'Not configured');
       console.error('[DEBUG] Admin token:', hasAdminToken ? 'Configured' : 'Not configured');
       console.error('[DEBUG] Verified admin writes:', verifiedAdminWrites ? 'Enabled' : (verifiedAdminWritesTransitional ? 'Transitional' : 'Disabled'));
+      console.error('[DEBUG] Verified max quantity:', verifiedMaxQuantity.value, '- addable variants:', addableVariants.variants.size);
       console.error('[DEBUG] Session token:', (process.env.RECHARGE_SESSION_TOKEN && process.env.RECHARGE_SESSION_TOKEN.trim() !== '') ? 'Configured' : 'Not configured');
       console.error('[INFO] Server ready - listening for MCP requests');
     }

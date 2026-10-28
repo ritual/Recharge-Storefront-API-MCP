@@ -56,6 +56,18 @@ export const CHARGE_FIELDS = [
   'total_price',
 ];
 
+export const ONETIME_FIELDS = [
+  'id',
+  'address_id',
+  'product_title',
+  'variant_title',
+  'sku',
+  'quantity',
+  'price',
+  'next_charge_scheduled_at',
+  'external_variant_id',
+];
+
 export const CHARGE_LINE_ITEM_FIELDS = [
   'purchase_item_id',
   'purchase_item_type',

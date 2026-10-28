@@ -75,6 +75,59 @@ export const productTools = [
     },
   },
   {
+    name: 'find_addable_product',
+    description:
+      'Look up only the product the customer named, among the products that can be added to their orders here. ' +
+      'Do not list or present products as options. No match means it can\'t be added here; hand off to a support agent. ' +
+      'Never describe what a product does or make any health, ingredient or benefit claim.',
+    inputSchema: baseSchema.extend({
+      query: z.string().min(1).max(100).describe('The product name the customer used'),
+    }),
+    execute: async (client, args) => {
+      if (client.addableVariants.size === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Adding products isn\'t available here; hand off to a support agent.',
+            },
+          ],
+        };
+      }
+
+      // Admin catalog read; caller tokens are stripped in hosted mode, so this uses the server's admin token
+      let result;
+      try {
+        result = await client.findAddableProducts(args.query);
+      } catch (error) {
+        if (process.env.DEBUG === 'true') {
+          console.error(`[DEBUG] find_addable_product failed with status ${error.statusCode ?? 'unknown'}`);
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Products could not be looked up right now, so nothing can be added; hand off to a support agent.',
+            },
+          ],
+          isError: true,
+        };
+      }
+      const text = result.products.length === 0
+        ? `No product matching "${args.query}" can be added here; hand off to a support agent.`
+        : `Addable Products:\n${JSON.stringify(result, null, 2)}`;
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text,
+          },
+        ],
+      };
+    },
+  },
+  {
     name: 'search_products',
     description: 'Search for products using a query string. Useful for finding products by name, title, or other attributes.',
     inputSchema: baseSchema.extend({
