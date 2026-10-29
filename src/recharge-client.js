@@ -75,6 +75,26 @@ function countryCode(value) {
 }
 
 /**
+ * A subscription's currency as ISO 4217 uppercase: presentment_currency, else
+ * currency; '' if neither is usable. An existing subscription naming no
+ * currency is never assumed to be in the store's base currency.
+ */
+function subscriptionCurrency(subscription) {
+  const code = String((subscription && (subscription.presentment_currency || subscription.currency)) || '').trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(code) ? code : '';
+}
+
+/**
+ * The one currency every given subscription is in, or '' when any names
+ * none or they disagree.
+ */
+function sharedSubscriptionCurrency(subscriptions) {
+  const currencies = new Set(subscriptions.map(subscriptionCurrency));
+  const [only] = currencies;
+  return currencies.size === 1 && only ? only : '';
+}
+
+/**
  * Lowercased whole words of a product title or query, for word matching.
  */
 function titleWords(text) {
@@ -1544,6 +1564,45 @@ export class RechargeClient {
   }
 
   /**
+   * The currency the customer is billed in at this address: every active
+   * subscription there must name the same one. None, more than one, or one
+   * that can't be read is refused rather than guessed.
+   */
+  assertVerifiedSubscribedCurrency(addressId, subscriptions) {
+    const currency = sharedSubscriptionCurrency(subscriptions);
+    if (!currency) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: subscriptions on address ${addressId} are not in one known currency`);
+      }
+      throw verifiedWriteRefusal(
+        `The subscriptions at address ${addressId} are not all billed in one currency that can be confirmed, ` +
+        `so a product can't be added there in the customer's currency. No change was made.`
+      );
+    }
+    return currency;
+  }
+
+  /**
+   * Every active subscription the customer has, across addresses, keeping
+   * only their own records. More than one page fails closed.
+   */
+  async getVerifiedCustomerActiveSubscriptions(customerId) {
+    const response = await this.makeAdminRequest('GET', '/subscriptions', null, {
+      customer_id: customerId,
+      status: 'active',
+      limit: 250,
+    });
+    const subscriptions = (response && response.subscriptions) || [];
+    if ((response && response.next_cursor) || subscriptions.length >= 250) {
+      throw verifiedWriteRefusal('There are too many subscriptions on this account to check, so products can\'t be priced here. No change was made.');
+    }
+    return subscriptions.filter(subscription =>
+      String(subscription.customer_id) === String(customerId) &&
+      String(subscription.status || '').toLowerCase() === 'active'
+    );
+  }
+
+  /**
    * Live one-time items on an address the customer owns. Filtered here by
    * address only (no external_variant_id query filter, which is not
    * confirmed for 2021-11); customer_id is checked only when Recharge sends
@@ -1660,13 +1719,18 @@ export class RechargeClient {
    * Load an allowlisted variant from the Shopify storefront catalog, priced
    * for the address's country. Always a fresh read (never cached). Not
    * configured, not allowlisted, no country, missing, another product,
-   * unavailable, unpriced and not-subscribable all get the same refusal.
-   * Everything returned comes from the catalog record, never the caller.
+   * unavailable, unpriced and not-subscribable all get the same refusal; a
+   * price in a currency other than the customer's subscribed one gets its
+   * own. Everything returned comes from the catalog record, never the caller.
    */
-  async getVerifiedAddableVariant(variantId, planType, addressCountry) {
+  async getVerifiedAddableVariant(variantId, planType, addressCountry, subscribedCurrency) {
     const refusal = verifiedWriteRefusal(
       `That product can't be added here, so nothing was added. ` +
       `Use find_addable_product to look up the product the customer named; if it is not found, ${VERIFIED_HANDOFF}.`
+    );
+    const currencyRefusal = verifiedWriteRefusal(
+      `That product can't be priced in ${subscribedCurrency}, the currency of the customer's subscriptions at this address, ` +
+      `for this address's country, so it can't be added here. No change was made.`
     );
     const requested = String(variantId ?? '').trim();
     const productId = this.addableVariants.get(requested);
@@ -1683,6 +1747,13 @@ export class RechargeClient {
       }
       throw refusal;
     }
+    // Only the address's own market is read: a currency other than the subscribed one is refused, never switched
+    if (!marketCurrencyMatches(country, subscribedCurrency)) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: the ${country} market is not priced in ${subscribedCurrency}`);
+      }
+      throw currencyRefusal;
+    }
 
     // A catalog failure propagates, so the pre-write checks refuse with "could not be checked"
     const variant = (await this.catalog.lookupVariants([requested], country)).get(requested);
@@ -1692,6 +1763,13 @@ export class RechargeClient {
         console.error(`[DEBUG] Verified add refused: variant ${requested} is not sellable in product ${productId} for ${country}`);
       }
       throw refusal;
+    }
+    // Countries without a known market: the catalog's currency must still be the subscribed one
+    if (variant.currency !== subscribedCurrency) {
+      if (process.env.DEBUG === 'true') {
+        console.error(`[DEBUG] Verified add refused: variant ${requested} is priced in ${variant.currency} for ${country}, not ${subscribedCurrency}`);
+      }
+      throw currencyRefusal;
     }
 
     // A zero, missing or unreadable catalog price is never added (sample, gift or sync gap)
@@ -1755,19 +1833,20 @@ export class RechargeClient {
 
   /**
    * After an add, the price Recharge set must be positive and no more than
-   * the catalog list price the customer was told, and in the catalog's
-   * currency (compare-at prices are never used). A record that names no
-   * currency is only trusted when the catalog price is in the store's base
+   * the catalog list price the customer was told, and in the currency of the
+   * customer's subscriptions at the address (the catalog price was checked
+   * to be in it too; compare-at prices are never used). A record that names
+   * no currency is only trusted when that currency is the store's base
    * currency, since its price can't be compared with another currency.
    * Otherwise the record just created is deleted again and the add is
    * refused; if that delete fails, the assistant is told the outcome is
    * unknown. Only IDs are logged.
    */
-  async verifiedCheckCreatedPrice(collection, key, response, addressId, catalogPrice, catalogCurrency) {
+  async verifiedCheckCreatedPrice(collection, key, response, addressId, catalogPrice, subscribedCurrency) {
     const record = response && response[key];
     const price = money(record && record.price);
     const recordCurrency = record ? String(record.presentment_currency || record.currency || '').trim().toUpperCase() : '';
-    const expectedCurrency = String(catalogCurrency || '').toUpperCase();
+    const expectedCurrency = String(subscribedCurrency || '').toUpperCase();
     const sameCurrency = recordCurrency === '' ? expectedCurrency === STORE_BASE_CURRENCY : recordCurrency === expectedCurrency;
     if (price > 0 && price <= catalogPrice + 0.005 && sameCurrency) {
       return response;
@@ -1866,11 +1945,12 @@ export class RechargeClient {
     const requestedVariant = this.assertVerifiedId(variantId, 'Product variant', 'find_addable_product');
     this.assertVerifiedQuantity(quantity);
 
-    const { customerId, address, scheduledAt, variant } = await this.verifiedPreWriteChecks(async () => {
+    const { customerId, address, scheduledAt, variant, currency } = await this.verifiedPreWriteChecks(async () => {
       const customerId = await this.resolveVerifiedCustomerId(customerEmail);
       const { address, activeSubscriptions } = await this.getVerifiedActiveAddress(id, customerId);
+      const currency = this.assertVerifiedSubscribedCurrency(address.id, activeSubscriptions);
       const scheduledAt = await this.getVerifiedQueuedChargeDate(address.id, customerId, date);
-      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'onetime', address.country_code);
+      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'onetime', address.country_code, currency);
 
       const onetimes = await this.getVerifiedOnetimes(address.id, customerId);
       if (onetimes.some(onetime =>
@@ -1885,7 +1965,7 @@ export class RechargeClient {
         subscriptions: activeSubscriptions,
         onetimes,
       });
-      return { customerId, address, scheduledAt, variant };
+      return { customerId, address, scheduledAt, variant, currency };
     });
 
     // Recharge prices the item from the catalog: never send price, properties or titles.
@@ -1900,7 +1980,7 @@ export class RechargeClient {
     if (process.env.DEBUG === 'true') {
       console.error(`[DEBUG] Verified one-time add of variant ${variant.variantId} on address ${address.id} for customer ${customerId}`);
     }
-    return await this.verifiedCheckCreatedPrice('onetimes', 'onetime', response, address.id, variant.unitPrice, variant.currency);
+    return await this.verifiedCheckCreatedPrice('onetimes', 'onetime', response, address.id, variant.unitPrice, currency);
   }
 
   async verifiedCreateSubscription({ addressId, variantId, quantity, date, orderIntervalFrequency, orderIntervalUnit }, customerEmail) {
@@ -1914,10 +1994,11 @@ export class RechargeClient {
     const requestedVariant = this.assertVerifiedId(variantId, 'Product variant', 'find_addable_product');
     this.assertVerifiedQuantity(quantity);
 
-    const { customerId, address, scheduledAt, variant, matched, plan } = await this.verifiedPreWriteChecks(async () => {
+    const { customerId, address, scheduledAt, variant, currency, matched, plan } = await this.verifiedPreWriteChecks(async () => {
       const customerId = await this.resolveVerifiedCustomerId(customerEmail);
       const { address, activeSubscriptions } = await this.getVerifiedActiveAddress(id, customerId);
-      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'subscription', address.country_code);
+      const currency = this.assertVerifiedSubscribedCurrency(address.id, activeSubscriptions);
+      const variant = await this.getVerifiedAddableVariant(requestedVariant, 'subscription', address.country_code, currency);
 
       if (activeSubscriptions.some(subscription => externalId(subscription.external_variant_id) === variant.variantId)) {
         throw verifiedWriteRefusal(
@@ -1975,7 +2056,7 @@ export class RechargeClient {
         subscriptions: activeSubscriptions,
         onetimes: await this.getVerifiedOnetimes(address.id, customerId),
       });
-      return { customerId, address, scheduledAt, variant, matched, plan };
+      return { customerId, address, scheduledAt, variant, currency, matched, plan };
     });
 
     // Interval and plan come from verified records, never the raw input; no price, so Recharge
@@ -2002,47 +2083,72 @@ export class RechargeClient {
     if (process.env.DEBUG === 'true') {
       console.error(`[DEBUG] Verified subscription add of variant ${variant.variantId} on address ${address.id} for customer ${customerId}`);
     }
-    return await this.verifiedCheckCreatedPrice('subscriptions', 'subscription', response, address.id, variant.unitPrice, variant.currency);
+    return await this.verifiedCheckCreatedPrice('subscriptions', 'subscription', response, address.id, variant.unitPrice, currency);
   }
 
   /**
-   * Catalog country for find_addable_product: the customer's addresses'
-   * country_code when they all share one, otherwise US. Without an email
-   * (local, non-hosted use) there is no customer to read, so US.
+   * Catalog country and currency for find_addable_product. The currency is
+   * the one all of the customer's active subscriptions are in (none, more
+   * than one or one that can't be read is refused); the country is the
+   * country_code the addresses holding them share, otherwise US, and must be
+   * priced in that currency. Without an email (local, non-hosted use) there
+   * is no customer to read, so US in the store's base currency.
    */
-  async getAddableLookupCountry(customerEmail) {
+  async getAddableLookupContext(customerEmail) {
     if (typeof customerEmail !== 'string' || customerEmail.trim() === '') {
-      return DEFAULT_CATALOG_COUNTRY;
+      return { country: DEFAULT_CATALOG_COUNTRY, currency: STORE_BASE_CURRENCY };
     }
     const customerId = await this.resolveVerifiedCustomerId(customerEmail);
+    const subscriptions = await this.getVerifiedCustomerActiveSubscriptions(customerId);
+    if (subscriptions.length === 0) {
+      throw verifiedWriteRefusal('The customer has no active subscription, so products can\'t be priced here. No change was made.');
+    }
+    const currency = sharedSubscriptionCurrency(subscriptions);
+    if (!currency) {
+      throw verifiedWriteRefusal(
+        'The customer\'s active subscriptions are not all billed in one currency that can be confirmed, ' +
+        'so products can\'t be priced here. No change was made.'
+      );
+    }
+
+    // Only addresses holding an active subscription can be added to, so only they pick the country
+    const subscribedAddresses = new Set(subscriptions.map(subscription => String(subscription.address_id)));
     const response = await this.makeAdminRequest('GET', '/addresses', null, { customer_id: customerId, limit: 250 });
     const countries = new Set(((response && response.addresses) || [])
-      .filter(address => String(address.customer_id) === String(customerId))
+      .filter(address => String(address.customer_id) === String(customerId) && subscribedAddresses.has(String(address.id)))
       .map(address => countryCode(address.country_code)));
     const [only] = countries;
-    return countries.size === 1 && only ? only : DEFAULT_CATALOG_COUNTRY;
+    const country = countries.size === 1 && only ? only : DEFAULT_CATALOG_COUNTRY;
+    if (!marketCurrencyMatches(country, currency)) {
+      throw verifiedWriteRefusal(
+        `Products can't be priced in ${currency}, the currency of the customer's subscriptions, for the customer's address country, ` +
+        `so nothing can be added here. No change was made.`
+      );
+    }
+    return { country, currency };
   }
 
   /**
    * Every allowlisted variant from the catalog for a country, from the shared
-   * file cache (60 minutes, keyed by endpoint, agent profile, country and
-   * allowlist) when it has a valid entry. Only a lookup where every chunk
-   * succeeded and returned at least one variant is cached. Write-time checks
-   * never use this cache.
+   * file cache (60 minutes, keyed by endpoint, agent profile, country,
+   * currency and allowlist) when it has a valid entry. Only a lookup where
+   * every chunk succeeded, returned at least one variant and priced all of
+   * them in the currency is cached. Write-time checks never use this cache.
    */
-  async getCachedAddableCatalog(country) {
+  async getCachedAddableCatalog(country, currency) {
     const ids = [...this.addableVariants.keys()].sort();
     const { endpoint, profileUrl } = this.catalog;
     const cache = this.catalogCache && typeof endpoint === 'string' && typeof profileUrl === 'string' ? this.catalogCache : null;
-    const scope = { endpoint, profileUrl, country, addable: this.addableVariants };
+    const scope = { endpoint, profileUrl, country, currency, addable: this.addableVariants };
     const cached = cache ? await cache.get(scope) : null;
     if (cached) {
       return cached;
     }
     // A failed lookup throws here, so errors and partial results are never cached;
-    // nor is an empty one (a catalog blip would otherwise hide everything for an hour)
+    // nor is an empty one (a catalog blip would otherwise hide everything for an hour),
+    // nor one priced in another currency, so an entry never mixes currencies
     const variants = await this.catalog.lookupVariants(ids, country);
-    if (cache && variants.size > 0) {
+    if (cache && variants.size > 0 && [...variants.values()].every(variant => variant.currency === currency)) {
       await cache.set(scope, variants);
     }
     return variants;
@@ -2051,7 +2157,7 @@ export class RechargeClient {
   /**
    * Read-only lookup of allowlisted, available, priced variants whose
    * product or variant title matches the query, priced in the customer's
-   * country. Every query word must be a whole word of the title or the start
+   * country and subscribed currency. Every query word must be a whole word of the title or the start
    * of one ("men" never matches "women"). A variant the catalog doesn't
    * return for its allowlisted product is skipped, not fatal. Descriptions
    * are never read into the result.
@@ -2062,16 +2168,16 @@ export class RechargeClient {
       return { products: [] };
     }
 
-    const country = await this.getAddableLookupCountry(customerEmail);
-    const catalog = await this.getCachedAddableCatalog(country);
+    const { country, currency } = await this.getAddableLookupContext(customerEmail);
+    const catalog = await this.getCachedAddableCatalog(country, currency);
 
     const products = [];
     for (const [variantId, productId] of this.addableVariants) {
       const variant = catalog.get(variantId);
       if (!variant || variant.productId !== productId || variant.available !== true || !(variant.unitPrice > 0) ||
-          !marketCurrencyMatches(country, variant.currency)) {
+          !marketCurrencyMatches(country, variant.currency) || variant.currency !== currency) {
         if (process.env.DEBUG === 'true') {
-          console.error(`[DEBUG] find_addable_product skipped variant ${variantId}: not sellable in product ${productId} for ${country}`);
+          console.error(`[DEBUG] find_addable_product skipped variant ${variantId}: not sellable in product ${productId} for ${country} in ${currency}`);
         }
         continue;
       }

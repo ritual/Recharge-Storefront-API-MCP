@@ -54,39 +54,39 @@ function fixtures() {
     customers: [{ id: 100, email: EMAIL }, { id: 200, email: OTHER_EMAIL }],
     subscriptions: [
       {
-        id: 1001, customer_id: 100, address_id: 501, status: 'active', quantity: 1, is_prepaid: false,
+        id: 1001, customer_id: 100, address_id: 501, status: 'active', presentment_currency: 'USD', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
         external_variant_id: { ecommerce: '9001' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
       },
       {
-        id: 1002, customer_id: 100, address_id: 501, status: 'cancelled', quantity: 1, is_prepaid: false,
+        id: 1002, customer_id: 100, address_id: 501, status: 'cancelled', presentment_currency: 'USD', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 2, charge_interval_frequency: 2,
         external_variant_id: { ecommerce: '9002' }, price: '30.00',
       },
       {
-        id: 1003, customer_id: 100, address_id: 501, status: 'expired', quantity: 1, is_prepaid: false,
+        id: 1003, customer_id: 100, address_id: 501, status: 'expired', presentment_currency: 'USD', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
         external_variant_id: { ecommerce: '9003' },
       },
       {
-        id: 1004, customer_id: 100, address_id: 501, status: 'active', quantity: 1, is_prepaid: true,
+        id: 1004, customer_id: 100, address_id: 501, status: 'active', presentment_currency: 'USD', quantity: 1, is_prepaid: true,
         order_interval_unit: 'week', order_interval_frequency: 4, charge_interval_frequency: 12,
         external_variant_id: { ecommerce: '9004' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
       },
       {
         // Same address, different schedule: next ships on FUTURE_2
-        id: 1005, customer_id: 100, address_id: 501, status: 'active', quantity: 1, is_prepaid: false,
+        id: 1005, customer_id: 100, address_id: 501, status: 'active', presentment_currency: 'USD', quantity: 1, is_prepaid: false,
         order_interval_unit: 'week', order_interval_frequency: 2, charge_interval_frequency: 2,
         external_variant_id: { ecommerce: '9005' }, price: '20.00', next_charge_scheduled_at: `${FUTURE_2}T00:00:00`,
       },
       {
-        id: 2001, customer_id: 200, address_id: 601, status: 'active', quantity: 1, is_prepaid: false,
+        id: 2001, customer_id: 200, address_id: 601, status: 'active', presentment_currency: 'USD', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
         external_variant_id: { ecommerce: '9001' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
       },
       {
         // Someone else's active subscription returned for alice's address 502: must never count
-        id: 2002, customer_id: 200, address_id: 502, status: 'active', quantity: 1, is_prepaid: false,
+        id: 2002, customer_id: 200, address_id: 502, status: 'active', presentment_currency: 'USD', quantity: 1, is_prepaid: false,
         order_interval_unit: 'month', order_interval_frequency: 1, charge_interval_frequency: 1,
         external_variant_id: { ecommerce: '9001' }, price: '30.00', next_charge_scheduled_at: FUTURE_1,
       },
@@ -1063,11 +1063,25 @@ describe('write-failure logging', () => {
 // Shopify storefront catalog (UCP)
 // ---------------------------------------------------------------------------
 
-const withCountry = (country, addressIds = [501, 502]) => {
+// Moves the addresses to a country and (when known) their subscriptions to that market's currency
+const withCountry = (country, addressIds = [501, 502], currency = { US: 'USD', CA: 'CAD', GB: 'GBP', JP: 'JPY' }[country]) => {
   const db = fixtures();
   for (const address of db.addresses) {
     if (addressIds.includes(address.id)) {
       address.country_code = country;
+    }
+  }
+  if (currency !== undefined) {
+    setCurrency(db, currency, db.subscriptions.filter(subscription => addressIds.includes(subscription.address_id)).map(subscription => subscription.id));
+  }
+  return db;
+};
+
+// Sets presentment_currency on the given subscriptions
+const setCurrency = (db, currency, ids) => {
+  for (const subscription of db.subscriptions) {
+    if (ids.includes(subscription.id)) {
+      subscription.presentment_currency = currency;
     }
   }
   return db;
@@ -1392,7 +1406,7 @@ describe('adds priced from the Shopify catalog', () => {
 
   test('a lowercase country_code is used as the uppercase country', async () => {
     const { client, catalog } = makeClient({
-      db: withCountry('ca'),
+      db: withCountry('ca', [501, 502], 'CAD'),
       overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '106.82', presentment_currency: 'CAD' } }) },
     });
     await client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL);
@@ -1409,8 +1423,8 @@ describe('adds priced from the Shopify catalog', () => {
     assert.deepEqual((await client.findAddableProducts('natalbiotic', EMAIL)).products, []);
   });
 
-  test('a created record naming no currency is only trusted against a USD catalog price', async () => {
-    // CA: the record's 68.18 could be USD under a 106.82 CAD ceiling, so it is removed again
+  test('a created record naming no currency is only trusted when subscribed in USD', async () => {
+    // CA (CAD subscriptions): the record's 68.18 could be USD under a 106.82 CAD ceiling, so it is removed again
     const ca = makeClient({
       db: withCountry('CA'),
       overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '68.18' } }) },
@@ -1418,7 +1432,7 @@ describe('adds priced from the Shopify catalog', () => {
     await refusal(ca.client.verifiedCreateOnetime(onetimeArgs({ variantId: Number(NATALBIOTIC.variantId) }), EMAIL), /removed again/);
     assert.deepEqual(writes(ca.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
 
-    // US: no currency on the record, priced at the USD catalog price, is accepted
+    // US (USD subscriptions): no currency on the record, priced at the USD catalog price, is accepted
     const us = makeClient({
       overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '68.18' } }) },
     });
@@ -1436,10 +1450,11 @@ describe('adds priced from the Shopify catalog', () => {
 });
 
 describe('find_addable_product with the Shopify catalog', () => {
-  test("country comes from the customer's addresses: one shared country, otherwise US", async () => {
+  test("country comes from the customer's subscribed addresses: one shared country, otherwise US", async () => {
     for (const [db, expected, currency, price] of [
       [withCountry('CA'), 'CA', 'CAD', '45.00'],
-      [withCountry('CA', [501]), 'US', 'USD', '33.00'],
+      // 502 (US) holds none of alice's subscriptions, so only 501 (CA) picks the country
+      [withCountry('CA', [501]), 'CA', 'CAD', '45.00'],
       [fixtures(), 'US', 'USD', '33.00'],
     ]) {
       const { client, catalog, calls } = makeClient({ db });
@@ -1468,7 +1483,7 @@ describe('find_addable_product with the Shopify catalog', () => {
       assert.match(result.content[0].text, /"currency": "USD"/);
     }
     assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, 'US');
-    assert.deepEqual(calls.filter(call => call.endpoint === '/customers' || call.endpoint === '/addresses'), []);
+    assert.deepEqual(calls.filter(call => ['/customers', '/addresses', '/subscriptions'].includes(call.endpoint)), []);
   });
 
   test('unit_price uses the currency minor-unit digits (JPY has none)', async () => {
@@ -1484,6 +1499,7 @@ describe('find_addable_product with the Shopify catalog', () => {
     await client.findAddableProducts('essential', EMAIL);
     db.addresses[0].country_code = 'US';
     db.addresses[1].country_code = 'US';
+    setCurrency(db, 'USD', db.subscriptions.map(subscription => subscription.id));
     await client.findAddableProducts('essential', EMAIL);
     await client.findAddableProducts('protein', EMAIL);
     assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.context.address_country), ['CA', 'US']);
@@ -1668,7 +1684,7 @@ describe('find_addable_product shared file cache', () => {
     assert.equal(cacheFiles(dir).length, cases.length);
   });
 
-  test('a corrupt, wrong-version, future, mis-scoped or mistyped entry is a miss and is overwritten', async t => {
+  test('a corrupt, wrong-version, future, mis-scoped (country or currency) or mistyped entry is a miss and is overwritten', async t => {
     const dir = tempCacheDir(t);
     const seeded = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
     const expected = (await seeded.client.findAddableProducts('essential', EMAIL)).products;
@@ -1685,12 +1701,14 @@ describe('find_addable_product shared file cache', () => {
       'not JSON': 'hello',
       'null': 'null',
       'an array': '[]',
-      'wrong version': { ...good, version: 2 },
+      'wrong version': { ...good, version: 1 },
       'no version': { ...good, version: undefined },
       'future storedAt': { ...good, storedAt: Date.now() + 60 * 1000 },
       'storedAt as a string': { ...good, storedAt: String(good.storedAt) },
       'fractional storedAt': { ...good, storedAt: good.storedAt + 0.5 },
       'another country': { ...good, country: 'CA' },
+      'another currency': { ...good, currency: 'CAD' },
+      'no currency': { ...good, currency: undefined },
       'variants not an array': { ...good, variants: {} },
       'variant not an object': { ...good, variants: [...good.variants.slice(1), 'x'] },
       'variantId not allowlisted': withVariant('variantId', '123'),
@@ -1707,6 +1725,7 @@ describe('find_addable_product shared file cache', () => {
       'currency not an ISO 4217 code': withVariant('currency', 'USDX'),
       'currency lowercase': withVariant('currency', 'usd'),
       'currency empty with a price': withVariant('currency', ''),
+      'variant in another currency': withVariant('currency', 'CAD'),
       'available as a string': withVariant('available', 'true'),
     };
     for (const [label, entry] of Object.entries(cases)) {
@@ -1715,7 +1734,8 @@ describe('find_addable_product shared file cache', () => {
       assert.deepEqual((await client.findAddableProducts('essential', EMAIL)).products, expected, label);
       assert.equal(catalog.requests.length, 1, label);
       const rewritten = JSON.parse(readFileSync(file, 'utf8'));
-      assert.equal(rewritten.version, 1, label);
+      assert.equal(rewritten.version, 2, label);
+      assert.equal(rewritten.currency, 'USD', label);
       assert.deepEqual(rewritten.variants, good.variants, label);
       assert.deepEqual(cacheFiles(dir), [path.basename(file)], label);
     }
@@ -1812,7 +1832,7 @@ describe('find_addable_product shared file cache', () => {
     assert.ok(!text.includes(DESCRIPTION_MARKER));
     assert.doesNotMatch(text, /description|html|handle|sku|<p>/i);
     const entry = JSON.parse(text);
-    assert.deepEqual(Object.keys(entry).sort(), ['country', 'storedAt', 'variants', 'version']);
+    assert.deepEqual(Object.keys(entry).sort(), ['country', 'currency', 'storedAt', 'variants', 'version']);
     assert.ok(entry.variants.length > 0);
     for (const variant of entry.variants) {
       assert.deepEqual(Object.keys(variant).sort(), STORED_FIELDS);
@@ -1947,6 +1967,315 @@ describe('find_addable_product shared file cache', () => {
     }
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(cacheFiles(dir), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adds in the customer's subscribed currency
+// ---------------------------------------------------------------------------
+
+// A refused add: the hand-off text, "No change was made" and no write
+async function currencyRefusal(calls, promise, pattern) {
+  await refusal(promise, pattern);
+  await refusal(promise, /No change was made/);
+  assert.equal(writes(calls).length, 0);
+}
+
+const natalbioticArgs = args => args({ variantId: Number(NATALBIOTIC.variantId) });
+// The catalog for a market Shopify has no known currency for (MX), priced as the given currency per variant
+const mxCatalog = (currencyFor = () => 'MXN') => {
+  const catalogDb = catalogFixtures();
+  catalogDb.MX = structuredClone(catalogDb.US);
+  for (const product of catalogDb.MX) {
+    for (const variant of product.variants) {
+      variant.price.currency = currencyFor(variant.id);
+    }
+  }
+  return catalogDb;
+};
+const findCatalogContext = catalog => catalog.requests.map(request => request.body.params.arguments.catalog.context.address_country);
+
+describe('adds in the subscribed currency', () => {
+  test('a one-time add in the subscribed currency goes through', async () => {
+    const { client, calls, catalog } = makeClient({
+      db: withCountry('CA'),
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '106.82', presentment_currency: 'CAD' } }) },
+    });
+    await client.verifiedCreateOnetime(natalbioticArgs(onetimeArgs), EMAIL);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes']);
+    assert.deepEqual(findCatalogContext(catalog), ['CA']);
+  });
+
+  test('a subscription add in the subscribed currency goes through', async () => {
+    const { client, calls, catalog } = makeClient({
+      db: withCountry('CA'),
+      overrides: { 'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, ...data, price: '94.00', presentment_currency: 'CAD' } }) },
+    });
+    await client.verifiedCreateSubscription(natalbioticArgs(subscriptionArgs), EMAIL);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /subscriptions']);
+    assert.equal(writes(calls)[0].data.plan_id, 4);
+    assert.deepEqual(findCatalogContext(catalog), ['CA']);
+  });
+
+  test('CAD subscriptions on an address whose country is priced in USD are refused before the catalog is read', async () => {
+    const { client, calls, catalog } = makeClient({ db: setCurrency(fixtures(), 'CAD', [1001, 1004, 1005]) });
+    await currencyRefusal(calls, client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /can't be priced in CAD/);
+    await currencyRefusal(calls, client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /can't be priced in CAD/);
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test('USD subscriptions on a CA address are refused before the catalog is read', async () => {
+    const { client, calls, catalog } = makeClient({ db: withCountry('CA', [501, 502], 'USD') });
+    await currencyRefusal(calls, client.verifiedCreateOnetime(natalbioticArgs(onetimeArgs), EMAIL), /can't be priced in USD/);
+    await currencyRefusal(calls, client.verifiedCreateSubscription(natalbioticArgs(subscriptionArgs), EMAIL), /can't be priced in USD/);
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test('subscriptions in more than one currency at the address are refused', async () => {
+    const { client, calls, catalog } = makeClient({ db: setCurrency(fixtures(), 'CAD', [1005]) });
+    await currencyRefusal(calls, client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /not all billed in one currency/);
+    await currencyRefusal(calls, client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /not all billed in one currency/);
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test('a subscription naming no currency is refused, never assumed to be USD', async () => {
+    const db = fixtures();
+    delete db.subscriptions.find(subscription => subscription.id === 1004).presentment_currency;
+    const { client, calls, catalog } = makeClient({ db });
+    await currencyRefusal(calls, client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /not all billed in one currency/);
+    await currencyRefusal(calls, client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /not all billed in one currency/);
+    assert.equal(catalog.requests.length, 0);
+
+    // An empty presentment_currency falls back to currency, read case-insensitively
+    const fallback = fixtures();
+    for (const subscription of fallback.subscriptions) {
+      subscription.presentment_currency = '';
+      subscription.currency = 'usd';
+    }
+    const accepted = makeClient({ db: fallback });
+    await accepted.client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
+    assert.deepEqual(writes(accepted.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes']);
+  });
+
+  test("cancelled, expired and other customers' subscriptions never set the currency", async () => {
+    const db = setCurrency(fixtures(), 'CAD', [1002, 1003]);
+    db.subscriptions.push({ ...structuredClone(db.subscriptions[5]), id: 2003, address_id: 501, presentment_currency: 'CAD' });
+    // Ignores the status filter too, so the cancelled and expired CAD records reach the client
+    const everyStatus = {
+      'GET /subscriptions': ({ params }) => ({
+        subscriptions: db.subscriptions
+          .filter(s => !params.address_id || String(s.address_id) === String(params.address_id))
+          .map(s => structuredClone(s)),
+      }),
+    };
+    const { client, calls, catalog } = makeClient({ db, overrides: everyStatus });
+    await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
+    await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'POST /subscriptions']);
+    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    assert.deepEqual([first.unit_price, first.currency], ['33.00', 'USD']);
+    assert.deepEqual(findCatalogContext(catalog), ['US', 'US', 'US']);
+  });
+
+  test('an add follows the currency of the subscriptions at that address, not the rest of the account', async () => {
+    // 501 stays US with USD subscriptions; 502 is CA and holds alice's CAD subscription
+    const twoCurrencies = () => {
+      const db = fixtures();
+      db.addresses.find(address => address.id === 502).country_code = 'CA';
+      db.subscriptions.push({ ...structuredClone(db.subscriptions[0]), id: 1006, address_id: 502, presentment_currency: 'CAD' });
+      return db;
+    };
+    const add = async (addressId, recordCurrency) => {
+      const { client, calls, catalog } = makeClient({
+        db: twoCurrencies(),
+        overrides: {
+          'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '33.00', presentment_currency: recordCurrency } }),
+          'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, ...data, price: '29.70', presentment_currency: recordCurrency } }),
+        },
+      });
+      const results = await Promise.allSettled([
+        client.verifiedCreateOnetime(onetimeArgs({ addressId }), EMAIL),
+        client.verifiedCreateSubscription(subscriptionArgs({ addressId }), EMAIL),
+      ]);
+      return { results, calls, catalog };
+    };
+
+    for (const [addressId, country, currency] of [['501', 'US', 'USD'], ['502', 'CA', 'CAD']]) {
+      const { results, calls, catalog } = await add(addressId, currency);
+      assert.deepEqual(results.map(result => result.status), ['fulfilled', 'fulfilled'], addressId);
+      assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`).sort(), ['POST /onetimes', 'POST /subscriptions'], addressId);
+      assert.deepEqual(findCatalogContext(catalog), [country, country], addressId);
+    }
+
+    // The created record is held to that address's currency, not the other one on the account
+    for (const [addressId, otherCurrency] of [['501', 'CAD'], ['502', 'USD']]) {
+      const { results, calls } = await add(addressId, otherCurrency);
+      for (const result of results) {
+        assert.equal(result.status, 'rejected', addressId);
+        assert.match(result.reason.message, /removed again/);
+      }
+      assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`).sort(),
+        ['DELETE /onetimes/4001', 'DELETE /subscriptions/1101', 'POST /onetimes', 'POST /subscriptions'], addressId);
+    }
+  });
+
+  test('presentment_currency is read before currency when a subscription has both', async () => {
+    // presentment_currency is the customer's market; currency may be the store's base currency
+    const withBase = db => {
+      for (const subscription of db.subscriptions) {
+        subscription.currency = 'USD';
+      }
+      return db;
+    };
+    const { client, calls, catalog } = makeClient({
+      db: withBase(withCountry('CA')),
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '106.82', presentment_currency: 'CAD' } }) },
+    });
+    await client.verifiedCreateOnetime(natalbioticArgs(onetimeArgs), EMAIL);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes']);
+    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    assert.deepEqual([first.unit_price, first.currency], ['45.00', 'CAD']);
+    assert.deepEqual(findCatalogContext(catalog), ['CA', 'CA']);
+
+    const us = makeClient({ db: withBase(setCurrency(fixtures(), 'CAD', [1001, 1004, 1005])) });
+    await currencyRefusal(us.calls, us.client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /can't be priced in CAD/);
+    const result = await toolByName('find_addable_product').execute(us.client, { customer_email: EMAIL, query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /can't be priced in CAD.*No change was made/);
+    assert.equal(us.catalog.requests.length, 0);
+  });
+
+  test('an address with no subscriptions is still refused, whatever the customer is billed in', async () => {
+    const { client, calls, catalog } = makeClient();
+    await refusal(client.verifiedCreateOnetime(onetimeArgs({ addressId: '502' }), EMAIL), /has no active subscription/);
+    await refusal(client.verifiedCreateSubscription(subscriptionArgs({ addressId: '502' }), EMAIL), /has no active subscription/);
+    assert.equal(writes(calls).length, 0);
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test('a catalog price in another currency for a country with no known market is refused', async () => {
+    const { client, calls, catalog } = makeClient({
+      db: withCountry('MX', [501, 502], 'MXN'),
+      catalog: makeCatalog({ db: mxCatalog(() => 'USD') }),
+    });
+    await currencyRefusal(calls, client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /can't be priced in MXN/);
+    assert.deepEqual(findCatalogContext(catalog), ['MX']);
+  });
+
+  test('a created record in another currency than the subscribed one is deleted again and refused', async () => {
+    const onetime = makeClient({
+      db: withCountry('CA'),
+      overrides: { 'POST /onetimes': ({ data }) => ({ onetime: { id: 4001, ...data, price: '68.18', presentment_currency: 'USD' } }) },
+    });
+    await refusal(onetime.client.verifiedCreateOnetime(natalbioticArgs(onetimeArgs), EMAIL), /removed again/);
+    assert.deepEqual(writes(onetime.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'DELETE /onetimes/4001']);
+
+    const subscription = makeClient({
+      db: withCountry('CA'),
+      overrides: { 'POST /subscriptions': ({ data }) => ({ subscription: { id: 1101, ...data, price: '94.00', currency: 'GBP' } }) },
+    });
+    await refusal(subscription.client.verifiedCreateSubscription(natalbioticArgs(subscriptionArgs), EMAIL), /removed again/);
+    assert.deepEqual(writes(subscription.calls).map(call => `${call.method} ${call.endpoint}`), ['POST /subscriptions', 'DELETE /subscriptions/1101']);
+  });
+
+  test('the created record is checked against the subscribed currency', async () => {
+    const { client, calls } = makeClient();
+    const response = { onetime: { id: 4001, address_id: 501, price: '106.82', presentment_currency: 'CAD' } };
+    assert.equal(await client.verifiedCheckCreatedPrice('onetimes', 'onetime', response, 501, 106.82, 'CAD'), response);
+    assert.equal(writes(calls).length, 0);
+    await refusal(client.verifiedCheckCreatedPrice('onetimes', 'onetime', response, 501, 106.82, 'USD'), /removed again/);
+    assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['DELETE /onetimes/4001']);
+  });
+});
+
+describe('find_addable_product in the subscribed currency', () => {
+  test('prices are quoted in the currency of the active subscriptions', async () => {
+    for (const [db, country, currency, price] of [[withCountry('CA'), 'CA', 'CAD', '45.00'], [fixtures(), 'US', 'USD', '33.00']]) {
+      const { client, calls, catalog } = makeClient({ db });
+      const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+      assert.deepEqual([first.unit_price, first.currency], [price, currency]);
+      assert.deepEqual(findCatalogContext(catalog), [country]);
+      assert.deepEqual(calls.find(call => call.endpoint === '/subscriptions').params, { customer_id: '100', status: 'active', limit: 250 });
+    }
+  });
+
+  test('an address with no subscriptions does not pick the country', async () => {
+    // 501 is CA with CAD subscriptions; 502 is US and holds none of alice's
+    const { client, catalog } = makeClient({ db: withCountry('CA', [501]) });
+    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    assert.deepEqual(findCatalogContext(catalog), ['CA']);
+    assert.deepEqual([first.unit_price, first.currency], ['45.00', 'CAD']);
+  });
+
+  test('customer subscriptions in more than one currency are refused', async () => {
+    const db = fixtures();
+    db.subscriptions.push({ ...structuredClone(db.subscriptions[0]), id: 1006, address_id: 502, presentment_currency: 'CAD' });
+    const { client, catalog, calls } = makeClient({ db });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /not all billed in one currency.*No change was made.*hand off to a support agent/);
+    assert.equal(catalog.requests.length, 0);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  test('a customer with no active subscription is refused', async () => {
+    const db = fixtures();
+    for (const subscription of db.subscriptions.filter(item => item.customer_id === 100)) {
+      subscription.status = 'cancelled';
+    }
+    const { client, catalog } = makeClient({ db });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /no active subscription.*No change was made.*hand off to a support agent/);
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test("a subscribed currency the country's market is not priced in is refused and nothing is cached", async t => {
+    const dir = tempCacheDir(t);
+    const { client, catalog } = makeClient({ db: setCurrency(fixtures(), 'CAD', [1001, 1004, 1005]), catalogCache: createAddableCatalogCache({ dir }) });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /can't be priced in CAD.*No change was made.*hand off to a support agent/);
+    assert.equal(catalog.requests.length, 0);
+    assert.deepEqual(cacheFiles(dir), []);
+  });
+
+  test('a variant priced in another currency is skipped and the lookup is not cached', async t => {
+    const dir = tempCacheDir(t);
+    const { client, catalog } = makeClient({
+      db: withCountry('MX', [501, 502], 'MXN'),
+      catalog: makeCatalog({ db: mxCatalog(id => (id === variantGid('8006') ? 'USD' : 'MXN')) }),
+      catalogCache: createAddableCatalogCache({ dir }),
+    });
+    const { products } = await client.findAddableProducts('essential', EMAIL);
+    assert.deepEqual(products.map(product => [product.variant_id, product.currency]), [[8001, 'MXN']]);
+    assert.deepEqual(findCatalogContext(catalog), ['MX']);
+    assert.deepEqual(cacheFiles(dir), []);
+  });
+
+  test('more than one page of subscriptions fails closed', async () => {
+    // A next_cursor, or a full page of 250 with none (the rest may be missing either way)
+    const fullPage = Array.from({ length: 250 }, (_, index) => ({ ...structuredClone(fixtures().subscriptions[0]), id: 10000 + index }));
+    for (const page of [{ subscriptions: [], next_cursor: 'next' }, { subscriptions: fullPage }]) {
+      const { client, catalog } = makeClient({ overrides: { 'GET /subscriptions': () => structuredClone(page) } });
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /too many subscriptions on this account to check.*No change was made.*hand off to a support agent/);
+      assert.equal(catalog.requests.length, 0);
+    }
+  });
+
+  test('the cache keeps the same country in another currency as its own entry', async t => {
+    const dir = tempCacheDir(t);
+    const cache = createAddableCatalogCache({ dir });
+    const scope = { endpoint: UCP_URL, profileUrl: PROFILE_URL, country: 'US', addable: new Map([['8001', '7001']]) };
+    const variant = currency => new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: '30 count', unitPrice: 33, currency, available: true }]]);
+    await cache.set({ ...scope, currency: 'USD' }, variant('USD'));
+    assert.equal(await createAddableCatalogCache({ dir }).get({ ...scope, currency: 'CAD' }), null);
+    assert.equal((await createAddableCatalogCache({ dir }).get({ ...scope, currency: 'USD' })).get('8001').currency, 'USD');
+    await cache.set({ ...scope, currency: 'CAD' }, variant('CAD'));
+    assert.equal((await createAddableCatalogCache({ dir }).get({ ...scope, currency: 'CAD' })).get('8001').currency, 'CAD');
+    assert.equal(cacheFiles(dir).length, 2);
   });
 });
 
@@ -2139,7 +2468,7 @@ describe('server (stdio)', () => {
     const endpoint = 'https://127.0.0.1:9/api/ucp/mcp';
     const seed = createShopifyCatalog({ endpoint, profileUrl: PROFILE_URL, fetchImpl: async () => { throw new Error('no network'); } });
     await createAddableCatalogCache({ dir }).set(
-      { endpoint: seed.endpoint, profileUrl: seed.profileUrl, country: 'US', addable: new Map([['8001', '7001']]) },
+      { endpoint: seed.endpoint, profileUrl: seed.profileUrl, country: 'US', currency: 'USD', addable: new Map([['8001', '7001']]) },
       new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: '30 count', unitPrice: 33, currency: 'USD', available: true }]]),
     );
     assert.equal(cacheFiles(dir).length, 1);

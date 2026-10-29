@@ -113,8 +113,9 @@ if (!shopifyCatalog && shopifyCatalogConfig.warnings.length === 0 && addableVari
 
 /**
  * find_addable_product's catalog read is cached for 60 minutes in files under
- * MCP_CATALOG_CACHE_DIR (default <os tmpdir>/recharge-mcp-catalog-cache), so
- * the per-request child processes of a stateless HTTP gateway share it.
+ * MCP_CATALOG_CACHE_DIR (default <os tmpdir>/recharge-mcp-catalog-cache), one
+ * entry per country and currency, so the per-request child processes of a
+ * stateless HTTP gateway share it.
  * create_onetime and create_subscription always read the catalog fresh.
  */
 const catalogCacheDir = parseCatalogCacheDir(process.env.MCP_CATALOG_CACHE_DIR);
