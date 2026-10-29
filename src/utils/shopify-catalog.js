@@ -7,6 +7,10 @@
  * public UCP storefront MCP endpoint (no token), calling its lookup_catalog
  * tool with the server's UCP agent profile and the shipping country.
  *
+ * find_addable_product can also call its search_catalog tool when the
+ * customer's words don't name an addable product; only the ranked product IDs
+ * and titles are kept from a search, never its prices or variants.
+ *
  * Only IDs, titles, price, currency and availability are kept from the
  * response. Descriptions, media and URLs are dropped here and never returned
  * or logged.
@@ -15,6 +19,10 @@
 // lookup_catalog rejects more than 10 IDs per call ("array size at `/catalog/ids` is greater than: 10")
 export const CATALOG_LOOKUP_CHUNK = 10;
 export const DEFAULT_CATALOG_TIMEOUT_MS = 8000;
+// Longest search query sent to search_catalog (find_addable_product caps the query at 100 too)
+export const CATALOG_SEARCH_MAX_QUERY = 100;
+// Most search results asked for in one call (search_catalog's own default page size)
+export const CATALOG_SEARCH_MAX_LIMIT = 10;
 
 const VARIANT_GID = 'gid://shopify/ProductVariant/';
 // A remote error code is only kept for DEBUG logs when it is a short plain token
@@ -127,7 +135,11 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
   }
   let nextId = 1;
 
-  async function call(gids, country) {
+  /**
+   * One tools/call to the UCP endpoint; `action` ("lookup" or "search") only
+   * names the call in error messages. Returns the result's products list.
+   */
+  async function call(tool, catalogArgs, action) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let text;
@@ -140,10 +152,10 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
           id: nextId++,
           method: 'tools/call',
           params: {
-            name: 'lookup_catalog',
+            name: tool,
             arguments: {
               meta: { 'ucp-agent': { profile: profileUrl } },
-              catalog: { ids: gids, context: { address_country: country } },
+              catalog: catalogArgs,
             },
           },
         }),
@@ -152,7 +164,7 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
         redirect: 'error',
       });
       if (!response || !response.ok) {
-        throw catalogError(`Catalog lookup failed with HTTP ${response && response.status}`, {
+        throw catalogError(`Catalog ${action} failed with HTTP ${response && response.status}`, {
           statusCode: (response && response.status) || null,
           code: 'http_error',
         });
@@ -163,7 +175,7 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
         throw error;
       }
       const timedOut = controller.signal.aborted;
-      throw catalogError(timedOut ? 'Catalog lookup timed out' : 'Catalog lookup request failed', {
+      throw catalogError(timedOut ? `Catalog ${action} timed out` : `Catalog ${action} request failed`, {
         code: timedOut ? 'timeout' : 'network_error',
       });
     } finally {
@@ -177,26 +189,27 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
       if (message && message.error) {
         const raw = (message.error.data && message.error.data.code) || message.error.code;
         const code = (typeof raw === 'string' || typeof raw === 'number') && SAFE_CODE.test(String(raw)) ? String(raw) : 'rpc_error';
-        throw catalogError(`Catalog lookup returned JSON-RPC error ${code}`, { code });
+        throw catalogError(`Catalog ${action} returned JSON-RPC error ${code}`, { code });
       }
       if (!message || !message.result || message.result.isError === true) {
-        throw catalogError('Catalog lookup returned a tool error', { code: 'tool_error' });
+        throw catalogError(`Catalog ${action} returned a tool error`, { code: 'tool_error' });
       }
       content = lookupContent(message.result);
     } catch (error) {
       if (error && error.name === 'ShopifyCatalogError') {
         throw error;
       }
-      throw catalogError('Catalog lookup response could not be read', { code: 'unparseable' });
+      throw catalogError(`Catalog ${action} response could not be read`, { code: 'unparseable' });
     }
     if (!content || !Array.isArray(content.products)) {
-      throw catalogError('Catalog lookup response had no products list', { code: 'unparseable' });
+      throw catalogError(`Catalog ${action} response had no products list`, { code: 'unparseable' });
     }
     // Only "info" messages (e.g. not_found for an unknown ID) are expected; a warning or error
-    // (say, a country priced from another market) means the prices can't be trusted
+    // (say, a country priced from another market) means the prices can't be trusted, and a
+    // search answered with one is treated the same way
     if (content.messages !== undefined && content.messages !== null &&
         (!Array.isArray(content.messages) || content.messages.some(item => !item || item.type !== 'info'))) {
-      throw catalogError('Catalog lookup returned a warning or error message', { code: 'catalog_message' });
+      throw catalogError(`Catalog ${action} returned a warning or error message`, { code: 'catalog_message' });
     }
     return content.products;
   }
@@ -220,7 +233,8 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
     for (let start = 0; start < ids.length; start += CATALOG_LOOKUP_CHUNK) {
       chunks.push(new Set(ids.slice(start, start + CATALOG_LOOKUP_CHUNK).map(id => `${VARIANT_GID}${id}`)));
     }
-    const responses = await Promise.all(chunks.map(requested => call([...requested], country)));
+    const responses = await Promise.all(chunks.map(requested =>
+      call('lookup_catalog', { ids: [...requested], context: { address_country: country } }, 'lookup')));
 
     const found = new Map();
     const conflicting = new Set();
@@ -264,6 +278,51 @@ export function createShopifyCatalog({ endpoint, profileUrl, fetchImpl = globalT
     return found;
   }
 
+  /**
+   * Shopify's ranked search for the query in the given country: up to `limit`
+   * { productId, title } in Shopify's order, products only (no prices,
+   * variants or descriptions). The query is sent as typed (whitespace
+   * collapsed, capped at CATALOG_SEARCH_MAX_QUERY characters). Never cached.
+   * Any of those results without a product ID or title fails the search;
+   * a repeated product ID is skipped.
+   */
+  async function searchProducts(query, country, limit) {
+    if (!/^[A-Z]{2}$/.test(String(country || ''))) {
+      throw catalogError('Catalog search needs an ISO 3166-1 alpha-2 country', { code: 'invalid_country' });
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > CATALOG_SEARCH_MAX_LIMIT) {
+      throw catalogError(`Catalog search limit must be a whole number from 1 to ${CATALOG_SEARCH_MAX_LIMIT}`, { code: 'invalid_limit' });
+    }
+    // Control characters are dropped; anything else is Shopify's to interpret
+    const text = String(query ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, CATALOG_SEARCH_MAX_QUERY).trim();
+    if (!text) {
+      throw catalogError('Catalog search needs a query', { code: 'invalid_query' });
+    }
+
+    const products = await call('search_catalog', {
+      query: text,
+      context: { address_country: country },
+      pagination: { limit },
+    }, 'search');
+
+    const results = [];
+    const seen = new Set();
+    // Only the first `limit` results count, even if the endpoint returned more
+    for (const product of products.slice(0, limit)) {
+      const productMatch = PRODUCT_GID.exec(String((product && product.id) || ''));
+      // An entry without a product ID or title may be the product ranked first: the ranking can't be read
+      if (!productMatch || typeof product.title !== 'string' || !product.title.trim()) {
+        throw catalogError('Catalog search response could not be read', { code: 'unparseable' });
+      }
+      if (seen.has(productMatch[1])) {
+        continue;
+      }
+      seen.add(productMatch[1]);
+      results.push({ productId: productMatch[1], title: String(product.title ?? '') });
+    }
+    return results;
+  }
+
   // The endpoint and agent profile are part of the find_addable_product cache key
-  return { endpoint: httpsUrl(endpoint), profileUrl: httpsUrl(profileUrl), lookupVariants };
+  return { endpoint: httpsUrl(endpoint), profileUrl: httpsUrl(profileUrl), lookupVariants, searchProducts };
 }

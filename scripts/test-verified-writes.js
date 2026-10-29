@@ -19,7 +19,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RechargeClient } from '../src/recharge-client.js';
 import { RechargeAPIError, handleAPIError } from '../src/utils/error-handler.js';
-import { createShopifyCatalog, parseShopifyCatalogConfig } from '../src/utils/shopify-catalog.js';
+import { CATALOG_SEARCH_MAX_QUERY, createShopifyCatalog, parseShopifyCatalogConfig } from '../src/utils/shopify-catalog.js';
+import {
+  INTERPRETED_MAX_PRODUCTS,
+  INTERPRETED_SEARCH_DEPTH,
+  describesNeed,
+  matchAddableVariants,
+  matchByName,
+  matchWords,
+  queryWords,
+  wordMatch,
+} from '../src/utils/product-matching.js';
 import { ADDABLE_CATALOG_CACHE_TTL_MS, createAddableCatalogCache, parseCatalogCacheDir } from '../src/utils/catalog-cache.js';
 import { tools } from '../src/tools/index.js';
 import {
@@ -168,7 +178,7 @@ function ucpProduct(id, title, handle, variants) {
 function catalogFixtures() {
   const products = (currency, [p8001, p8006, p8007, natalbiotic]) => [
     ucpProduct('7001', 'Essential for Women 18+', 'essential-for-women', [
-      ucpVariant('8001', '30 count', p8001, currency),
+      ucpVariant('8001', 'essential for women 18+ 30 count', p8001, currency),
       ucpVariant('8006', '60 count', p8006, currency),
     ]),
     ucpProduct('7003', 'Future Thing', 'future-thing', [ucpVariant('8004', 'Default Title', 1000, currency, { available: false })]),
@@ -204,18 +214,38 @@ function lookupResponse(db, body) {
 }
 
 /**
- * A real catalog client over a fake fetch. `respond(body, init)` replaces
- * the default in-memory lookup. Every request is kept on `.requests`.
+ * The in-memory search_catalog answer: `search(query, body, init)` returns ranked
+ * product records (or a whole Response); by default nothing is found.
  */
-function makeCatalog({ db = catalogFixtures(), respond = null, timeoutMs, endpoint = UCP_URL, profileUrl = PROFILE_URL } = {}) {
+async function searchResponse(search, body, init) {
+  const found = search ? await search(body.params.arguments.catalog.query, body, init) : [];
+  if (found instanceof Response) {
+    return found;
+  }
+  return jsonResponse(rpcResult(body.id, { products: structuredClone(found), messages: [], pagination: { has_next_page: false } }));
+}
+
+/**
+ * A real catalog client over a fake fetch. `respond(body, init)` replaces
+ * the default in-memory lookup and search; `search` stubs only the search.
+ * lookup_catalog requests are kept on `.requests`, search_catalog ones on
+ * `.searches`.
+ */
+function makeCatalog({ db = catalogFixtures(), respond = null, search = null, timeoutMs, endpoint = UCP_URL, profileUrl = PROFILE_URL } = {}) {
   const requests = [];
+  const searches = [];
   const fetchImpl = async (url, init) => {
     const body = JSON.parse(init.body);
-    requests.push({ url, init, body });
-    return respond ? respond(body, init) : lookupResponse(db, body);
+    const isSearch = body.params.name === 'search_catalog';
+    (isSearch ? searches : requests).push({ url, init, body });
+    if (respond) {
+      return respond(body, init);
+    }
+    return isSearch ? searchResponse(search, body, init) : lookupResponse(db, body);
   };
   const catalog = createShopifyCatalog({ endpoint, profileUrl, fetchImpl, ...(timeoutMs ? { timeoutMs } : {}) });
   catalog.requests = requests;
+  catalog.searches = searches;
   return catalog;
 }
 
@@ -699,15 +729,15 @@ describe('verifiedCreateSubscription', () => {
 describe('find_addable_product', () => {
   test('matches only allowlisted, available variants and reports can_subscribe', async () => {
     const { client, calls } = makeClient();
-    const result = await client.findAddableProducts('essential women', EMAIL);
+    const result = await client.findAddableProducts('essential for women 18+', EMAIL);
     // Both allowlisted variants of the product, with variant_id as the number the add tools take;
     // 8010 (catalog says another product) is skipped
     assert.deepEqual(result.products, [
-      { variant_id: 8001, title: 'Essential for Women 18+', variant_title: '30 count', unit_price: '33.00', currency: 'USD', can_subscribe: true },
+      { variant_id: 8001, title: 'Essential for Women 18+', variant_title: 'essential for women 18+ 30 count', unit_price: '33.00', currency: 'USD', can_subscribe: true },
       { variant_id: 8006, title: 'Essential for Women 18+', variant_title: '60 count', unit_price: '60.00', currency: 'USD', can_subscribe: true },
     ]);
-    assert.deepEqual((await client.findAddableProducts('60 count', EMAIL)).products.map(product => product.variant_id), [8006]);
-    const protein = await client.findAddableProducts('PROTEIN', EMAIL);
+    assert.deepEqual((await client.findAddableProducts('women 18+ 60 count', EMAIL)).products.map(product => product.variant_id), [8006]);
+    const protein = await client.findAddableProducts('PROTEIN POWDER', EMAIL);
     assert.equal(protein.products[0].can_subscribe, false);
     assert.deepEqual((await client.findAddableProducts('unpublished', EMAIL)).products, []);
     assert.deepEqual((await client.findAddableProducts('future thing', EMAIL)).products, []);
@@ -716,7 +746,7 @@ describe('find_addable_product', () => {
 
   test('empty allowlist says adding is not available', async () => {
     const { client, calls } = makeClient({ addable: new Map() });
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.match(result.content[0].text, /Adding products isn't available here; hand off to a support agent/);
     assert.equal(calls.length, 0);
   });
@@ -745,7 +775,7 @@ describe('logging', () => {
       await client.verifiedUpdateSubscriptionQuantity('1001', 2, EMAIL);
       await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
       await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
-      await client.findAddableProducts('essential', EMAIL);
+      await client.findAddableProducts('essential for women 18+', EMAIL);
       await client.verifiedUpdateSubscriptionQuantity('2001', 2, EMAIL).catch(() => {});
       await client.verifiedCreateOnetime(onetimeArgs({ variantId: 8002 }), EMAIL).catch(() => {});
       await client.verifiedCreateOnetime(onetimeArgs({ variantId: 8003 }), EMAIL).catch(() => {});
@@ -753,7 +783,7 @@ describe('logging', () => {
       await client.verifiedCreateOnetime(onetimeArgs({ variantId: 8010 }), EMAIL).catch(() => {});
       const failingCatalog = makeClient({ catalog: makeCatalog({ respond: () => new Response('nope', { status: 500 }) }) });
       await failingCatalog.client.verifiedCreateOnetime(onetimeArgs(), EMAIL).catch(() => {});
-      await toolByName('find_addable_product').execute(failingCatalog.client, { customer_email: EMAIL, query: 'essential' });
+      await toolByName('find_addable_product').execute(failingCatalog.client, { customer_email: EMAIL, query: 'essential for women 18+' });
       const failing = makeClient({ overrides: { 'POST /onetimes': () => { throw new RechargeAPIError('boom', 502); } } });
       await failing.client.verifiedCreateOnetime(onetimeArgs(), EMAIL).catch(() => {});
     } finally {
@@ -988,13 +1018,13 @@ describe('find_addable_product matching and load', () => {
     const { client } = makeClient();
     assert.deepEqual((await client.findAddableProducts('Essential for Men', EMAIL)).products, []);
     assert.deepEqual((await client.findAddableProducts('men', EMAIL)).products, []);
-    assert.equal((await client.findAddableProducts('wom', EMAIL)).products.length, 2);
-    assert.equal((await client.findAddableProducts('18+', EMAIL)).products.length, 2);
+    assert.equal((await client.findAddableProducts('wome 18+', EMAIL)).products.length, 2);
+    assert.equal((await client.findAddableProducts('women 18+', EMAIL)).products.length, 2);
   });
 
   test('catalog reads are one lookup per search and cached between searches', async () => {
     const { client, calls, catalog } = makeClient();
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     assert.equal(catalog.requests.length, 1);
     // Every allowlisted variant in that one call
     assert.equal(catalog.requests[0].body.params.arguments.catalog.ids.length, ADDABLE.size);
@@ -1005,7 +1035,7 @@ describe('find_addable_product matching and load', () => {
 
   test('a rate limit becomes a hand-off, not a raw API error', async () => {
     const { client } = makeClient({ catalog: makeCatalog({ respond: () => new Response('Too Many Requests', { status: 429 }) }) });
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /could not be looked up right now.*hand off to a support agent/);
     assert.doesNotMatch(result.content[0].text, /API Error|429/);
@@ -1134,7 +1164,7 @@ describe('catalog client', () => {
   test('only exact matches on the requested ID count', async () => {
     const catalog = makeCatalog({
       respond: body => {
-        const product = ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', 3300, 'USD')]);
+        const product = ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 3300, 'USD')]);
         product.variants[0].inputs = [{ id: variantGid('8001'), match: 'fuzzy' }];
         return jsonResponse(rpcResult(body.id, { products: [product], messages: [] }));
       },
@@ -1191,7 +1221,7 @@ describe('catalog client', () => {
     const catalog = makeCatalog({
       respond: (body, init) => {
         if (init.redirect !== 'error') {
-          return jsonResponse(rpcResult(body.id, { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 99, 'USD')])], messages: [] }));
+          return jsonResponse(rpcResult(body.id, { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 99, 'USD')])], messages: [] }));
         }
         throw new TypeError('fetch failed: unexpected redirect');
       },
@@ -1220,7 +1250,7 @@ describe('catalog client', () => {
   });
 
   test('a warning or error message fails the lookup; info messages do not', async () => {
-    const products = [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 3300, 'USD')])];
+    const products = [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 3300, 'USD')])];
     for (const messages of [
       [{ type: 'warning', code: 'market_fallback', content: 'priced from the default market' }],
       [{ type: 'error', code: 'pricing_unavailable', content: variantGid('8001') }],
@@ -1239,8 +1269,8 @@ describe('catalog client', () => {
   test('structuredContent wins over the text copy', async () => {
     const catalog = makeCatalog({
       respond: body => {
-        const structured = { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 3300, 'USD')])], messages: [] };
-        const text = { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 1, 'USD')])], messages: [] };
+        const structured = { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 3300, 'USD')])], messages: [] };
+        const text = { products: [ucpProduct('7001', 'E', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 1, 'USD')])], messages: [] };
         return jsonResponse({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: JSON.stringify(text) }], structuredContent: structured, isError: false } });
       },
     });
@@ -1250,8 +1280,8 @@ describe('catalog client', () => {
   test('a variant returned under two products is ambiguous and dropped', async () => {
     const respond = body => jsonResponse(rpcResult(body.id, {
       products: [
-        ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', 3300, 'USD'), ucpVariant('8006', '60 count', 6000, 'USD')]),
-        ucpProduct('7007', 'Gummies', 'g', [ucpVariant('8001', '30 count', 100, 'USD')]),
+        ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 3300, 'USD'), ucpVariant('8006', '60 count', 6000, 'USD')]),
+        ucpProduct('7007', 'Gummies', 'g', [ucpVariant('8001', 'essential for women 18+ 30 count', 100, 'USD')]),
       ],
       messages: [],
     }));
@@ -1265,21 +1295,21 @@ describe('catalog client', () => {
   test('a non-integer, negative or string amount is never a price', async () => {
     for (const amount of [68.18, '6818', -1, null, Number.MAX_SAFE_INTEGER + 2]) {
       const respond = body => jsonResponse(rpcResult(body.id, {
-        products: [ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', amount, 'USD')])], messages: [],
+        products: [ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', amount, 'USD')])], messages: [],
       }));
       const variant = (await makeCatalog({ respond }).lookupVariants(['8001'], 'US')).get('8001');
       assert.ok(Number.isNaN(variant.unitPrice), String(amount));
       const { client, calls } = makeClient({ catalog: makeCatalog({ respond }) });
       await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /That product can't be added here/);
       assert.equal(writes(calls).length, 0, String(amount));
-      assert.deepEqual((await client.findAddableProducts('30 count', EMAIL)).products, [], String(amount));
+      assert.deepEqual((await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products, [], String(amount));
     }
   });
 
   test('fraction digits come from the currency (JPY 0, KWD 3, unknown currency NaN)', async () => {
     const respond = body => jsonResponse(rpcResult(body.id, {
       products: [
-        ucpProduct('7001', 'E', 'e', [ucpVariant('8001', '30 count', 1000, 'JPY'), ucpVariant('8006', '60 count', 12345, 'KWD')]),
+        ucpProduct('7001', 'E', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 1000, 'JPY'), ucpVariant('8006', '60 count', 12345, 'KWD')]),
         ucpProduct('7005', 'P', 'p', [ucpVariant('8007', 'Chocolate', 3300, 'XYZ1')]),
       ],
       messages: [],
@@ -1375,7 +1405,7 @@ describe('adds priced from the Shopify catalog', () => {
 
   test('write-time checks always read the catalog fresh', async () => {
     const { client, catalog } = makeClient();
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
     await client.verifiedCreateOnetime(onetimeArgs({ date: FUTURE_2 }), EMAIL);
     assert.equal(catalog.requests.length, 3);
@@ -1385,7 +1415,7 @@ describe('adds priced from the Shopify catalog', () => {
     const { client, calls } = makeClient({ catalog: null });
     await refusal(client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /That product can't be added here/);
     await refusal(client.verifiedCreateSubscription(subscriptionArgs(), EMAIL), /That product can't be added here/);
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.match(result.content[0].text, /Adding products isn't available here; hand off to a support agent/);
     assert.equal(writes(calls).length, 0);
   });
@@ -1458,7 +1488,7 @@ describe('find_addable_product with the Shopify catalog', () => {
       [fixtures(), 'US', 'USD', '33.00'],
     ]) {
       const { client, catalog, calls } = makeClient({ db });
-      const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+      const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
       assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, expected);
       assert.deepEqual([first.unit_price, first.currency], [price, currency]);
       assert.deepEqual(calls.find(call => call.endpoint === '/addresses').params, { customer_id: '100', limit: 250 });
@@ -1470,7 +1500,7 @@ describe('find_addable_product with the Shopify catalog', () => {
     const db = withCountry('CA');
     db.addresses.find(address => address.id === 601).country_code = 'US';
     const { client, catalog } = makeClient({ db });
-    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
     assert.equal(catalog.requests[0].body.params.arguments.catalog.context.address_country, 'CA');
     assert.deepEqual([first.unit_price, first.currency], ['45.00', 'CAD']);
   });
@@ -1478,7 +1508,7 @@ describe('find_addable_product with the Shopify catalog', () => {
   test('without customer_email the US catalog is used and no customer is read', async () => {
     const { client, catalog, calls } = makeClient({ db: withCountry('CA') });
     for (const email of [undefined, '', '   ']) {
-      const result = await toolByName('find_addable_product').execute(client, { customer_email: email, query: '30 count' });
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: email, query: 'essential for women 18+ 30 count' });
       assert.ok(!result.isError);
       assert.match(result.content[0].text, /"currency": "USD"/);
     }
@@ -1487,20 +1517,20 @@ describe('find_addable_product with the Shopify catalog', () => {
   });
 
   test('unit_price uses the currency minor-unit digits (JPY has none)', async () => {
-    const catalogDb = { JP: [ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', '30 count', 1000, 'JPY')])] };
+    const catalogDb = { JP: [ucpProduct('7001', 'Essential for Women 18+', 'e', [ucpVariant('8001', 'essential for women 18+ 30 count', 1000, 'JPY')])] };
     const { client } = makeClient({ db: withCountry('JP'), catalog: makeCatalog({ db: catalogDb }) });
-    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
     assert.deepEqual([first.unit_price, first.currency], ['1000', 'JPY']);
   });
 
   test('the cache is per country', async () => {
     const db = withCountry('CA');
     const { client, catalog } = makeClient({ db });
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     db.addresses[0].country_code = 'US';
     db.addresses[1].country_code = 'US';
     setCurrency(db, 'USD', db.subscriptions.map(subscription => subscription.id));
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     await client.findAddableProducts('protein', EMAIL);
     assert.deepEqual(catalog.requests.map(request => request.body.params.arguments.catalog.context.address_country), ['CA', 'US']);
   });
@@ -1509,12 +1539,12 @@ describe('find_addable_product with the Shopify catalog', () => {
     const catalogDb = catalogFixtures();
     catalogDb.US[0].variants = catalogDb.US[0].variants.filter(variant => variant.id !== variantGid('8001'));
     const { client } = makeClient({ catalog: makeCatalog({ db: catalogDb }) });
-    assert.deepEqual((await client.findAddableProducts('essential', EMAIL)).products.map(product => product.variant_id), [8006]);
+    assert.deepEqual((await client.findAddableProducts('essential for women 18+', EMAIL)).products.map(product => product.variant_id), [8006]);
   });
 
   test('descriptions never reach the tool output', async () => {
     const { client } = makeClient();
-    for (const query of ['essential', 'natalbiotic', 'protein']) {
+    for (const query of ['essential for women 18+', 'natalbiotic', 'protein']) {
       const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query });
       assert.ok(!result.isError, query);
       assert.ok(!result.content[0].text.includes(DESCRIPTION_MARKER), query);
@@ -1531,7 +1561,7 @@ describe('find_addable_product with the Shopify catalog', () => {
     const { client } = makeClient({
       catalog: makeCatalog({ respond: () => jsonResponse({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'UCP discovery failed', data: { code: 'profile_malformed' } } }) }),
     });
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /could not be looked up right now.*hand off to a support agent/);
     assert.doesNotMatch(result.content[0].text, /UCP|profile_malformed/);
@@ -1539,10 +1569,1441 @@ describe('find_addable_product with the Shopify catalog', () => {
 
   test('an unknown customer gets the customer-safe refusal, not a lookup', async () => {
     const { client, catalog } = makeClient();
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: 'nobody@example.com', query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: 'nobody@example.com', query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /Customer not found.*hand off to a support agent/);
     assert.equal(catalog.requests.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// find_addable_product matching: by name (stage 1), then interpreted by search (stage 2)
+// ---------------------------------------------------------------------------
+
+// Live ritual.com titles (curly apostrophes and trademark glyphs as served); IDs and some flavors are made up
+const MATCH_PRODUCTS = [
+  ['7101', 'Women’s Multivitamin 18+', [['8101', 'Mint / 30 servings', 3750], ['8102', 'Citrus / 30 servings', 3750]]],
+  ['7102', 'Women’s Multivitamin 50+', [['8103', 'Default Title', 4432]]],
+  ['7103', 'Men’s Multivitamin 18+', [['8104', '30 servings', 3750]]],
+  ['7104', 'Men’s Multivitamin 50+', [['8105', 'Default Title', 4432]]],
+  ['7105', 'Prenatal Multivitamin', [['8106', 'Citrus', 4432], ['8107', 'Mint', 4432]]],
+  ['7106', 'Daily Shake', [['8108', 'Vanilla', 5000]]],
+  ['7107', 'Daily Shake', [['8109', 'Chocolate', 5000]]],
+  ['7108', 'Daily Shake Pregnancy & Postpartum', [['8110', 'Vanilla', 5000]]],
+  ['7109', 'Omega-3 DHA & EPA', [['8111', 'Default Title', 3750]]],
+  ['7110', 'Natalbiotic™', [['8112', 'Default Title', 6818]]],
+  ['7111', 'Synbiotic+', [['8113', '30 servings', 6136]]],
+  ['7112', 'Sleep', [['8114', 'Default Title', 2841]]],
+  ['7113', 'Magnesium+', [['8115', 'Default Title', 5682]]],
+  ['7114', 'Creatine Greens', [['8116', 'Default Title', 6591]]],
+  ['7115', 'Daily Shake', [['8117', 'Strawberry', 5000]]],
+  ['7116', 'Daily Shake', [['8118', 'Coffee', 5000]]],
+];
+// On the storefront and in search results, but not allowlisted
+const MATCH_NOT_ADDABLE = [
+  ['7201', 'Prenatal Essential Support Ritual*', [['8201', 'Default Title', 9000]]],
+  ['7202', 'The Shaker', [['8202', 'Default Title', 1500]]],
+  ['7203', 'Daily Health 18+ Support Ritual*', [['8203', 'Default Title', 8700]]],
+  ['7204', 'Gut & Skin Support Ritual*', [['8204', 'Default Title', 10800]]],
+  ['7205', 'Mom-to-Baby Support Ritual*', [['8205', 'Default Title', 9900]]],
+];
+const MATCH_ADDABLE = new Map(MATCH_PRODUCTS.flatMap(([productId, , variants]) => variants.map(([variantId]) => [variantId, productId])));
+
+function matchCatalogDb() {
+  const build = (currency, factor) => [...MATCH_PRODUCTS, ...MATCH_NOT_ADDABLE].map(([id, title, variants]) =>
+    ucpProduct(id, title, `handle-${id}`, variants.map(([variantId, variantTitle, amount]) =>
+      ucpVariant(variantId, variantTitle, Math.round(amount * factor), currency))));
+  return { US: build('USD', 1), CA: build('CAD', 1.5) };
+}
+
+/**
+ * search_catalog records for product IDs in rank order. Each is priced at 1
+ * EUR minor unit with only a search-only variant, so any price, currency or
+ * variant taken from the search instead of the lookup would show.
+ */
+function searchRecords(ids) {
+  return ids.map(id => {
+    const known = [...MATCH_PRODUCTS, ...MATCH_NOT_ADDABLE].find(([productId]) => productId === id);
+    return ucpProduct(id, known ? known[1] : `Unknown ${id}`, `handle-${id}`, [ucpVariant(`9${id}`, 'Search Only', 1, 'EUR')]);
+  });
+}
+
+// A search stub answering each query with the product IDs listed for it, and nothing for any other query
+const searchFor = answers => query => searchRecords(answers[query] || []);
+
+function matchClient({ answers = {}, search = searchFor(answers), db, catalogDb = matchCatalogDb(), timeoutMs } = {}) {
+  return makeClient({
+    ...(db ? { db } : {}),
+    addable: MATCH_ADDABLE,
+    catalog: makeCatalog({ db: catalogDb, search, ...(timeoutMs ? { timeoutMs } : {}) }),
+  });
+}
+
+// matchCatalogDb() with one variant (or each of a list) changed in every country
+function matchCatalogDbWith(variantIds, change) {
+  const db = matchCatalogDb();
+  const changed = [].concat(variantIds).map(variantGid);
+  for (const products of Object.values(db)) {
+    for (const variant of products.flatMap(product => product.variants)) {
+      if (changed.includes(variant.id)) {
+        change(variant);
+      }
+    }
+  }
+  return db;
+}
+
+// Every live addable product title, for matcher-only tests (IDs and flavors made up)
+const LIVE_PRODUCTS = [
+  ['101', 'Women’s Multivitamin 18+', ['Mint', 'Citrus']],
+  ['102', 'Women’s Multivitamin 50+', ['Default Title']],
+  ['103', 'Men’s Multivitamin 18+', ['Default Title']],
+  ['104', 'Men’s Multivitamin 50+', ['Default Title']],
+  ['105', 'Prenatal Multivitamin', ['Citrus', 'Mint']],
+  ['106', 'Postnatal Multivitamin', ['Citrus', 'Mint']],
+  ['107', 'Daily Shake', ['Vanilla']],
+  ['108', 'Daily Shake', ['Chocolate']],
+  ['109', 'Daily Shake Pregnancy & Postpartum', ['Vanilla']],
+  ['110', 'Natalbiotic™', ['Default Title']],
+  ['111', 'Synbiotic+', ['Default Title']],
+  ['112', 'Omega-3 DHA & EPA', ['Default Title']],
+  ['113', 'Sleep', ['Default Title']],
+  ['114', 'Stress Relief', ['Default Title']],
+  ['115', 'Iron', ['Default Title']],
+  ['116', 'Magnesium+', ['Default Title']],
+  ['117', 'HyaCera™', ['Default Title']],
+  ['118', 'Creatine Greens', ['Default Title']],
+  ['119', 'Fertility Support', ['Default Title']],
+  ['120', 'Perimenopause Health', ['Default Title']],
+  ['121', 'Natal Choline', ['Default Title']],
+];
+const LIVE_VARIANTS = LIVE_PRODUCTS.flatMap(([productId, productTitle, variantTitles]) =>
+  variantTitles.map((variantTitle, index) => ({ variantId: `${productId}${index}`, productId, productTitle, variantTitle })));
+
+// Search results ranking the given LIVE_PRODUCTS IDs
+const liveRanking = ranking => ranking.map(productId => ({ productId, title: LIVE_PRODUCTS.find(([id]) => id === productId)[1] }));
+
+/**
+ * matchAddableVariants over LIVE_VARIANTS with a search ranking the given
+ * product IDs, as "Title [variant]" strings, and whether it searched. The
+ * products or variants listed in `unsellable` are passed as unsellable.
+ */
+async function matchLive(query, ranking = [], unsellable = []) {
+  let searched = false;
+  const search = async () => {
+    searched = true;
+    return liveRanking(ranking);
+  };
+  const gone = variant => unsellable.includes(variant.productId) || unsellable.includes(variant.variantId);
+  const { match, variants } = await matchAddableVariants(query, LIVE_VARIANTS.filter(variant => !gone(variant)), {
+    search,
+    unsellable: LIVE_VARIANTS.filter(gone),
+  });
+  return { match, titles: variants.map(variant => `${variant.productTitle} [${variant.variantTitle}]`), searched };
+}
+
+const variantIds = result => result.products.map(product => product.variant_id);
+
+describe('find_addable_product matching by name', () => {
+  test('old names, possessives, curly apostrophes, symbols and abbreviations match by name with no search', async () => {
+    const { client, catalog } = matchClient();
+    for (const [query, expected] of [
+      ['Essential for Women 18+', [8101, 8102]],
+      ["women's multivitamin 18+", [8101, 8102]],
+      ['Women’s Multivitamin 18+', [8101, 8102]],
+      ['WOMENS MULTI 18', [8101, 8102]],
+      ['mens multi 50 plus', [8105]],
+      ['Essential Prenatal', [8106, 8107]],
+      ['prenatal vitamins', [8106, 8107]],
+      ['Natalbiotic™', [8112]],
+      ['natalbiotic', [8112]],
+      ['Omega-3 DHA and EPA', [8111]],
+      ['omega3', [8111]],
+      ['omega 3s', [8111]],
+      ['synbiotic plus', [8113]],
+      ['Magnesium+', [8115]],
+      ['greens', [8116]],
+      ['please add one more bottle of my ritual sleep', [8114]],
+    ]) {
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(variantIds(result), expected, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('plurals match, and the closest titles come first', async () => {
+    const { client } = matchClient();
+    // Every Daily Shake before Daily Shake Pregnancy & Postpartum, which has words the customer didn't say
+    assert.deepEqual(variantIds(await client.findAddableProducts('daily shakes', EMAIL)), [8108, 8109, 8117, 8118, 8110]);
+  });
+
+  test('small typos match; short words and longer words never fuzz', async () => {
+    const { client } = matchClient();
+    for (const [query, expected] of [
+      ['prenatl', [8106, 8107]],
+      ['magnesum', [8115]],
+      ['omgea 3', [8111]],
+      ['synbiotc', [8113]],
+      ['womens multivitamen 18+', [8101, 8102]],
+      ['creatin greens', [8116]],
+      // The trademark glyph is dropped, not read as "tm": "natalbiotictm" would be two typos away
+      ['natalbiotc', [8112]],
+      // Two typos in a word of 9+ letters
+      ['multivitmn', [8106, 8107, 8101, 8102, 8103, 8104, 8105]],
+    ]) {
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(variantIds(result), expected, query);
+    }
+    // "slep" is too short for a typo; "shaker" is another word, not "shake" misspelled
+    for (const query of ['slep', 'shaker']) {
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+    }
+    assert.equal(wordMatch('men', 'women'), null);
+    assert.equal(wordMatch('wome', 'women'), 'exact');
+    assert.equal(wordMatch('postnatal', 'prenatal'), null);
+    assert.equal(wordMatch('multivitamn', 'multivitamin'), 'fuzzy');
+    assert.equal(wordMatch('perimenapause', 'perimenopause'), 'fuzzy');
+    // Another ending on the title word's stem is another word: "perimenopausal" states a condition
+    assert.equal(wordMatch('perimenopausal', 'perimenopause'), null);
+    // So is the whole title word with letters in front: "infertility" names a condition, not Fertility Support
+    assert.equal(wordMatch('infertility', 'fertility'), null);
+    assert.equal(wordMatch('asleep', 'sleep'), null);
+    assert.equal(wordMatch('fertilty', 'fertility'), 'fuzzy');
+    assert.equal(wordMatch('symbiotic', 'synbiotic'), 'fuzzy');
+    assert.deepEqual(matchWords('Natalbiotic™'), ['natalbiotic']);
+    // One typo from 5 letters, two from 9: never two below 9
+    assert.equal(wordMatch('prenatl', 'prenatal'), 'fuzzy');
+    assert.equal(wordMatch('prentl', 'prenatal'), null);
+    assert.equal(wordMatch('multivitmn', 'multivitamin'), 'fuzzy');
+    assert.equal(wordMatch('sinbiotik', 'synbiotic'), 'fuzzy');
+    assert.equal(wordMatch('prinatel', 'prenatal'), null);
+  });
+
+  test('a prefix needs 5 letters, or all but the last letter: "heal" is not Health, "d3" is not Omega-3 DHA & EPA', async () => {
+    assert.equal(wordMatch('d', 'dha'), null);
+    assert.equal(wordMatch('dh', 'dha'), null);
+    assert.equal(wordMatch('pr', 'prenatal'), null);
+    // Shorter starts are often other words
+    for (const [word, titleWord] of [['heal', 'health'], ['pre', 'prenatal'], ['post', 'postnatal'], ['wom', 'women'], ['supp', 'support'],
+      ['rel', 'relief'], ['fert', 'fertility'], ['stre', 'stress'], ['magn', 'magnesium'], ['cho', 'choline']]) {
+      assert.equal(wordMatch(word, titleWord), null, `${word} ${titleWord}`);
+    }
+    for (const [word, titleWord] of [['omega', 'omega'], ['omeg', 'omega'], ['iro', 'iron'], ['slee', 'sleep'], ['wome', 'women'],
+      ['magnes', 'magnesium'], ['creat', 'creatine'], ['prena', 'prenatal'], ['multivit', 'multivitamin'], ['healt', 'health']]) {
+      assert.equal(wordMatch(word, titleWord), 'exact', `${word} ${titleWord}`);
+    }
+    // Abbreviations too short for a prefix are synonyms
+    assert.deepEqual(queryWords('mag peri choc multi'), ['magnesium', 'perimenopause', 'chocolate', 'multivitamin']);
+    for (const [query, expected] of [
+      ['heal', []], ['perimenopause heal', []], ['pre', []], ['supp', []],
+      ['omega', ['Omega-3 DHA & EPA [Default Title]']], ['magnes', ['Magnesium+ [Default Title]']], ['mag', ['Magnesium+ [Default Title]']],
+      ['creat greens', ['Creatine Greens [Default Title]']], ['peri', ['Perimenopause Health [Default Title]']],
+      ['choc shake', ['Daily Shake [Chocolate]']],
+    ]) {
+      const result = await matchLive(query, ['120', '105']);
+      assert.deepEqual(result.titles, expected, query);
+      assert.equal(result.searched, false, query);
+    }
+    const { client, catalog } = matchClient();
+    assert.deepEqual(await client.findAddableProducts('d3', EMAIL), { match: 'none', products: [] });
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('a title matched without a typo hides titles matched only with one', () => {
+    const variants = [
+      { variantId: '1', productId: '1', productTitle: 'Sheep', variantTitle: 'Default Title' },
+      { variantId: '2', productId: '2', productTitle: 'Sleep', variantTitle: 'Default Title' },
+    ];
+    assert.deepEqual(matchByName(queryWords('sleep'), variants).map(variant => variant.variantId), ['2']);
+    assert.deepEqual(matchByName(queryWords('sleeep'), variants).map(variant => variant.variantId), ['2']);
+  });
+
+  test('numbers never fuzz: 18+ and 50+ never match each other', async () => {
+    assert.equal(wordMatch('18', '18+'), 'exact');
+    assert.equal(wordMatch('18+', '18+'), 'exact');
+    for (const [word, titleWord] of [['18+', '50+'], ['50+', '18+'], ['18+', '18'], ['1', '18+'], ['50', '5'], ['30', '3']]) {
+      assert.equal(wordMatch(word, titleWord), null, `${word} ${titleWord}`);
+    }
+    const { client, catalog } = matchClient({ answers: { "Women's Multivitamin 40+": ['7101', '7102'] } });
+    assert.deepEqual(variantIds(await client.findAddableProducts("women's multivitamin 50+", EMAIL)), [8103]);
+    assert.deepEqual(variantIds(await client.findAddableProducts('Essential for Men 18+', EMAIL)), [8104]);
+    assert.deepEqual(variantIds(await client.findAddableProducts('women 18', EMAIL)), [8101, 8102]);
+    // A title without a number doesn't need one; the retired "Essential Protein" name is Daily Shake
+    const shake = await client.findAddableProducts('Essential Protein Daily Shake 18+', EMAIL);
+    assert.equal(shake.match, 'name');
+    assert.deepEqual(variantIds(shake).slice(0, 2), [8108, 8109]);
+    // No title has 40+, so it is never searched; a query of only that number never matches a title without one
+    assert.deepEqual(await client.findAddableProducts("Women's Multivitamin 40+", EMAIL), { match: 'none', products: [] });
+    assert.deepEqual(await client.findAddableProducts('40+', EMAIL), { match: 'none', products: [] });
+    assert.equal(catalog.searches.length, 0);
+    const variants = MATCH_PRODUCTS.flatMap(([productId, productTitle, productVariants]) =>
+      productVariants.map(([variantId, variantTitle]) => ({ variantId, productId, productTitle, variantTitle })));
+    assert.deepEqual(matchByName(queryWords('the 40+ one'), variants), []);
+  });
+
+  test('flavor words narrow to the variants named', async () => {
+    const { client } = matchClient();
+    for (const [query, expected] of [
+      ['mint prenatal', [8107]],
+      ["citrus women's", [8102]],
+      ['mint womens 18+', [8101]],
+      ['chocolate shake', [8109]],
+      ['vanilla shake', [8108, 8110]],
+    ]) {
+      assert.deepEqual(variantIds(await client.findAddableProducts(query, EMAIL)), expected, query);
+    }
+  });
+
+  test('a query of filler words matches nothing and never searches', async () => {
+    const { client, catalog } = matchClient({ search: () => searchRecords(['7112']) });
+    for (const query of ['ritual', 'the', 'please add my', '   ']) {
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('titles that matched the query\'s number hide titles that only had no number to match', async () => {
+    const { client } = matchClient();
+    assert.deepEqual(variantIds(await client.findAddableProducts('multivitamin 50+', EMAIL)), [8103, 8105]);
+    // Allowlist order reversed: Postnatal and Prenatal first still never match "50+"
+    const variants = [
+      ['1', 'Postnatal Multivitamin', 'Default Title'],
+      ['2', 'Prenatal Multivitamin', 'Mint'],
+      ['3', 'Men’s Multivitamin 50+', 'Default Title'],
+      ['4', 'Women’s Multivitamin 50+', 'Default Title'],
+      ['5', 'Women’s Multivitamin 18+', 'Mint / 30 servings'],
+    ].map(([id, productTitle, variantTitle]) => ({ variantId: id, productId: id, productTitle, variantTitle }));
+    assert.deepEqual(matchByName(queryWords('multivitamin 50+'), variants).map(variant => variant.variantId), ['3', '4']);
+    assert.deepEqual(matchByName(queryWords('womens multi 50 plus'), variants).map(variant => variant.variantId), ['4']);
+    // With no title carrying the number, the numberless titles still match ("Daily Shake" for the retired 18+ name)
+    assert.deepEqual(matchByName(queryWords('postnatal 18+'), variants).map(variant => variant.variantId), ['1']);
+    // A 50+ title matches apart from the flavor, which it doesn't come in: never the numberless title in that flavor
+    for (const query of ['mint multivitamin 50+', 'mint multi 50+', 'mins multivitamin 50+']) {
+      assert.deepEqual(matchByName(queryWords(query), variants), [], query);
+    }
+  });
+
+  test('with no title left in the query\'s age band, a title without one never stands in for it', async () => {
+    for (const [query, gone] of [['multivitamin 50+', ['102', '104']], ['multi 50 plus', ['102', '104']], ['multivitamin 18+', ['101', '103']]]) {
+      const variants = LIVE_VARIANTS.filter(variant => !gone.includes(variant.productId));
+      assert.deepEqual(matchByName(queryWords(query), variants), [], query);
+      // Nor by search, even when it ranks the numberless titles first
+      const search = async () => liveRanking(['105', '106']);
+      assert.deepEqual(await matchAddableVariants(query, variants, { search }), { match: 'none', variants: [] }, query);
+    }
+    // With 50+ only in the other gender's title (so the query is searched), a numberless women's title never stands in
+    const variants = [['1', 'Women’s Multivitamin 18+'], ['2', 'Men’s Multivitamin 50+'], ['3', 'Women’s Multivitamin']]
+      .map(([id, productTitle]) => ({ variantId: id, productId: id, productTitle, variantTitle: 'Default Title' }));
+    const search = async () => [{ productId: '3', title: 'Women’s Multivitamin' }, { productId: '1', title: 'Women’s Multivitamin 18+' }];
+    assert.deepEqual(await matchAddableVariants("women's multivitamin 50+", variants, { search }), { match: 'none', variants: [] });
+  });
+
+  test('"protein" without a shake word must match: "Essential Protein 18+" is never a multivitamin by its age band', async () => {
+    for (const query of ['essential protein 18+', 'essential protein 50+']) {
+      assert.deepEqual(await matchLive(query, ['107']), { match: 'interpreted', titles: ['Daily Shake [Vanilla]'], searched: true }, query);
+    }
+    for (const query of ['prenatal protein', 'mens protein', 'womens protein', 'essential protein 18+']) {
+      assert.deepEqual(await matchLive(query, ['105', '103', '101']), { match: 'none', titles: [], searched: true }, query);
+    }
+    // Alone (with or without an age band) it is a nutrient, never searched
+    for (const query of ['protein', 'protein 50+', 'PROTEIN']) {
+      assert.deepEqual(await matchLive(query, ['107']), { match: 'none', titles: [], searched: false }, query);
+    }
+    // Next to "shake" it is still the retired name
+    const shake = await matchLive('essential protein daily shake 18+');
+    assert.equal(shake.match, 'name');
+    assert.deepEqual(shake.titles.slice(0, 2), ['Daily Shake [Vanilla]', 'Daily Shake [Chocolate]']);
+    assert.deepEqual(queryWords('essential protein shake'), ['shake']);
+    assert.deepEqual(queryWords('essential protein 18+'), ['protein', '18+']);
+  });
+
+  test('a product named by its title that can\'t be sold now is nothing, never a sibling or another age band', async () => {
+    for (const [query, unsellable] of [
+      ['daily shake', ['107', '108']],
+      ['shake', ['107', '108']],
+      ['essential protein daily shake', ['107', '108']],
+      ['daily shake 18+', ['107', '108']],
+      ['daily shake vanilla', ['107']],
+      ['womens multivitamin', ['101']],
+      ['multivitamin 50+', ['102', '104']],
+      ['sleep', ['113']],
+    ]) {
+      assert.deepEqual(await matchLive(query, ['109', '102', '113'], unsellable), { match: 'none', titles: [], searched: false }, query);
+    }
+    // Another flavor or size of the same title is not another product, nor is a sibling ranked below the closest one
+    for (const [query, unsellable, expected] of [
+      ['daily shake', ['107'], ['Daily Shake [Chocolate]', 'Daily Shake Pregnancy & Postpartum [Vanilla]']],
+      ['womens multivitamin 18+', ['1010'], ['Women’s Multivitamin 18+ [Citrus]']],
+      ['womens multivitamin', ['1010'], ['Women’s Multivitamin 18+ [Citrus]', 'Women’s Multivitamin 50+ [Default Title]']],
+      ['daily shake pregnancy', ['107', '108'], ['Daily Shake Pregnancy & Postpartum [Vanilla]']],
+    ]) {
+      assert.deepEqual(await matchLive(query, [], unsellable), { match: 'name', titles: expected, searched: false }, query);
+    }
+    // Through the client: the catalog's out-of-stock variants are the unsellable ones
+    const outOfStock = variant => { variant.availability.available = false; };
+    for (const [query, gone, answers] of [
+      ['vanilla daily shake', '8108'],
+      ["women's multivitamin", ['8101', '8102']],
+      ['mint multivitamin', '8107'],
+      ['prenatal', ['8106', '8107'], { prenatal: ['7110'] }],
+    ]) {
+      const { client, catalog } = matchClient({ catalogDb: matchCatalogDbWith(gone, outOfStock), answers });
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+      assert.equal(catalog.searches.length, 0, query);
+    }
+    // An out-of-stock product still has a known title, so it never blocks partial names of the others
+    for (const [query, gone, expected] of [
+      ['women', '8113', [8101, 8102, 8103]],
+      ['shake', '8113', [8108, 8109, 8117, 8118, 8110]],
+      ['omega', '8114', [8111]],
+    ]) {
+      const { client } = matchClient({ catalogDb: matchCatalogDbWith(gone, outOfStock) });
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(variantIds(result), expected, query);
+    }
+  });
+
+  test('only retired product-line words name no one product: nothing, and never searched', async () => {
+    for (const query of ['essential', 'Essential', 'the essential one please']) {
+      assert.deepEqual(await matchLive(query, ['113']), { match: 'none', titles: [], searched: false }, query);
+    }
+  });
+
+  test('an age band and a flavor the age band doesn\'t come in match nothing, by name or by search', async () => {
+    const { client, catalog } = matchClient({
+      answers: { 'citrus multivitamin 50+': ['7105', '7102'], 'mint multi 50+': ['7102', '7105'], 'vanilla 50+': ['7106', '7108'] },
+    });
+    for (const query of ['citrus multivitamin 50+', 'mint multi 50+', 'vanilla 50+']) {
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+    }
+    assert.equal(catalog.searches.length, 3);
+    assert.deepEqual(variantIds(await client.findAddableProducts('citrus multivitamin', EMAIL)), [8106, 8102]);
+  });
+
+  test('other gender words, spelled-out age bands and "over" are normalized and match by name', async () => {
+    const { client, catalog } = matchClient();
+    for (const [query, expected] of [
+      ['male multivitamin 50+', [8105]],
+      ['multivitamin 50+ for him', [8105]],
+      ['his multivitamin', [8104, 8105]],
+      ['female multivitamin', [8101, 8102, 8103]],
+      ['ladies multivitamin 50+', [8103]],
+      ['multi for her 18+', [8101, 8102]],
+      ['mens multivitamin over fifty', [8105]],
+      ['womens multivitamin fifty plus', [8103]],
+      ['eighteen plus womens multi', [8101, 8102]],
+    ]) {
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(variantIds(result), expected, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+    assert.deepEqual(queryWords('fifty plus'), ['50+']);
+    assert.deepEqual(queryWords('males guys ladies females'), ['men', 'men', 'women', 'women']);
+    // An age description no title has is never searched
+    assert.deepEqual(await client.findAddableProducts('senior womens vitamins', EMAIL), { match: 'none', products: [] });
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('a request frame ending in "add" is dropped; need wording before "add" is not', async () => {
+    const { client, catalog } = matchClient({ search: () => searchRecords(['7114']) });
+    for (const [query, expected] of [
+      ['can you help me add sleep', [8114]],
+      ['please help me add magnesium', [8115]],
+      ['help me add the prenatal', [8106, 8107]],
+      ['can you help me add Synbiotic+', [8113]],
+      ['anything else? add Sleep', [8114]],
+      ['i want to order sleep', [8114]],
+      ['i need to add magnesium', [8115]],
+    ]) {
+      assert.equal(describesNeed(query), false, query);
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(variantIds(result), expected, query);
+    }
+    for (const query of ['something for stress, add sleep', 'help me sleep and add it', 'can you add something for sleep']) {
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('a word split in two matches the title word it joins into; "men" still never matches "women"', async () => {
+    const { client, catalog } = matchClient();
+    for (const [query, expected] of [
+      ['pre natal', [8106, 8107]],
+      ['pre-natal vitamins', [8106, 8107]],
+      ['mint pre natal', [8107]],
+      ['multi vitamin 50+', [8103, 8105]],
+      ['mens multi', [8104, 8105]],
+      ["men's multi vitamin", [8104, 8105]],
+    ]) {
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(variantIds(result), expected, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+    const postnatal = [{ variantId: '1', productId: '1', productTitle: 'Postnatal Multivitamin', variantTitle: 'Default Title' }];
+    assert.deepEqual(matchByName(queryWords('post natal'), postnatal), postnatal);
+    assert.equal(wordMatch('men', 'women'), null);
+    // The joined word must match exactly: "post natl" is one typo from "postnatal" joined, but that is no join
+    assert.equal(wordMatch('postnatl', 'postnatal'), 'fuzzy');
+    for (const query of ['post natl', 'pre natl', 'pre natel']) {
+      assert.deepEqual(matchByName(queryWords(query), LIVE_VARIANTS), [], query);
+    }
+  });
+
+  test('a title word\'s stem with another ending is another word only when the stem is nearly the whole title word', () => {
+    // "perimenopausal" and "postpartal" keep all but the last letter or two of the title word: other words
+    assert.equal(wordMatch('perimenopausal', 'perimenopause'), null);
+    assert.equal(wordMatch('postpartal', 'postpartum'), null);
+    // "synbioic" ends in "ic" too, but its stem drops three letters: it is "synbiotic" with a letter missed
+    assert.equal(wordMatch('synbioic', 'synbiotic'), 'fuzzy');
+    assert.equal(wordMatch('natalbioic', 'natalbiotic'), 'fuzzy');
+    assert.deepEqual(matchByName(queryWords('synbioic'), LIVE_VARIANTS).map(variant => variant.productTitle), ['Synbiotic+']);
+  });
+
+  test('Shopify\'s "Default Title" placeholder is never matched, by name or by search', async () => {
+    for (const query of ['default', 'title', 'default title', 'the default one', 'sleep default']) {
+      assert.deepEqual(await matchLive(query, ['113']), { match: 'none', titles: [], searched: false }, query);
+    }
+  });
+
+  test('accents are dropped on both sides', async () => {
+    assert.deepEqual(matchWords('Prénatal Multivitamín'), ['prenatal', 'multivitamin']);
+    for (const query of ['Prénatal', 'prénatal mint', 'MAGNÉSIUM']) {
+      const result = await matchLive(query);
+      assert.equal(result.match, 'name', query);
+    }
+    assert.deepEqual((await matchLive('prénatal mint')).titles, ['Prenatal Multivitamin [Mint]']);
+    const accented = [{ variantId: '1', productId: '1', productTitle: 'Crème Sleep', variantTitle: 'Default Title' }];
+    assert.deepEqual(await matchAddableVariants('creme sleep', accented), { match: 'name', variants: accented });
+  });
+
+  test('a query of only a number no title has matches nothing and is never searched', async () => {
+    for (const query of ['40+', '52', '7', '30 plus', 'the 40+ one']) {
+      assert.deepEqual(await matchLive(query, ['101']), { match: 'none', titles: [], searched: false }, query);
+    }
+  });
+
+  test('"vitamin d", "vitamin b12" and "zinc" never match a multivitamin; "vitamin", "multi" and "multivitamin" do', async () => {
+    const multivitamins = [8101, 8102, 8103, 8104, 8105, 8106, 8107];
+    // The search ranks multivitamins first, as a nutrient search on the live store can
+    const { client, catalog } = matchClient({
+      answers: { 'vitamin d': ['7101', '7105'], 'vitamin b12': ['7102', '7105', '7109'], zinc: ['7103', '7113'], 'womens vitamin d3': ['7101'] },
+    });
+    for (const query of ['vitamin d', 'vitamin b12', 'zinc', 'womens vitamin d3']) {
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+    }
+    // No title or alias has "vitamin", "d", "b" or "zinc", so none of them is even searched
+    assert.equal(catalog.searches.length, 0);
+    for (const query of ['vitamin', 'vitamins', 'multi', 'multivitamin']) {
+      const result = await client.findAddableProducts(query, EMAIL);
+      assert.equal(result.match, 'name', query);
+      // Prenatal Multivitamin first: it has fewest title words the query didn't mention
+      assert.deepEqual(variantIds(result).sort(), multivitamins, query);
+    }
+    assert.deepEqual(queryWords('vitamin b12'), ['vitamin', 'b', '12']);
+    assert.deepEqual(queryWords('prenatal vitamins'), ['prenatal', 'multivitamin']);
+  });
+
+  test('"vitamins" said of a product that isn\'t a multivitamin matches it only when the rest names its whole title', async () => {
+    // The search ranks the named product first; the name match never needs it
+    for (const [query, expected] of [
+      ['iron vitamins', 'Iron [Default Title]'],
+      ['my iron vitamin', 'Iron [Default Title]'],
+      ['add the iron vitamins', 'Iron [Default Title]'],
+      ['the sleep vitamins', 'Sleep [Default Title]'],
+      ['magnesium vitamin', 'Magnesium+ [Default Title]'],
+      // The nutrients a title names are what it contains, not its name
+      ['omega 3 vitamins', 'Omega-3 DHA & EPA [Default Title]'],
+      ['natal choline vitamin', 'Natal Choline [Default Title]'],
+    ]) {
+      const ranking = [LIVE_PRODUCTS.find(([, productTitle]) => expected.startsWith(`${productTitle} [`))[0]];
+      assert.deepEqual(await matchLive(query, ranking), { match: 'name', titles: [expected], searched: false }, query);
+    }
+    // Part of a title is not enough ("postpartum" is not Daily Shake Pregnancy & Postpartum), nor a single nutrient
+    for (const [query, ranking] of [['postpartum vitamins', ['109']], ['fertility vitamins', ['119']], ['stress vitamins', ['114']]]) {
+      assert.equal((await matchLive(query, ranking)).match, 'none', query);
+    }
+    for (const [query, ranking] of [['vitamin d', ['102']], ['senior womens vitamins', ['102']]]) {
+      assert.deepEqual(await matchLive(query, ranking), { match: 'none', titles: [], searched: false }, query);
+    }
+    // "multi" and "multivitamin" are never read as only "vitamins", and an unsellable Iron is never another product
+    assert.equal((await matchLive('iron multivitamin', ['115'])).match, 'none');
+    assert.equal((await matchLive('iron multi', ['115'])).match, 'none');
+    assert.equal((await matchLive('iron vitamins', ['115'], ['115'])).match, 'none');
+    assert.equal((await matchLive('prenatal vitamins')).titles.length, 2);
+  });
+});
+
+describe('find_addable_product never picks a product for a symptom, need or goal', () => {
+  const NEED_QUERIES = [
+    'help me sleep',
+    'something for stress',
+    'anything for energy',
+    'what\'s good for my skin',
+    'I have trouble sleeping',
+    'best one for pregnancy',
+    'recommend something',
+    'what should I take for sleep',
+    'which one is for stress',
+    'struggling to sleep',
+    'boost my energy',
+    'better sleep',
+    'improve my sleep',
+    'suggest a probiotic',
+    'symptoms of menopause',
+    // What it is for, ahead of any product name: a title word after it would otherwise match by name
+    'for pregnancy',
+    'the one for pregnancy',
+    'the one for stress',
+    'I need a supplement for stress',
+    'i want the one for stress',
+    'a product for stress',
+    'for my stress',
+    'sleep for my stress',
+    'stress relief for my stress',
+    'a pill for sleep',
+    'i need a supplement for sleep',
+    'for sleep',
+    'supplement for perimenopause',
+    'for my anxiety',
+    'for my skin',
+    'for insomnia',
+    'for digestion',
+    'in pregnancy',
+    // Who it is for, with no product named
+    'for my wife',
+    'the one for my husband',
+    'a pill for my daughter',
+    'for my wife\'s sleep',
+    // Wanting more of something or wanting to do something: the rest would match a title once filler is dropped
+    'i need more sleep',
+    'i want to sleep',
+    'i just want to sleep',
+    'i need to sleep',
+    'i want to get some sleep',
+    'i need more sleep please',
+    'i need some relief',
+    'i need some extra support',
+    'i need more greens',
+    'i want more greens',
+    'i need more protein',
+    'i want more protein',
+    'i need extra protein',
+    "I'd like more sleep",
+    'i would like some iron',
+    "i'd like more stress relief",
+    'i need extra sleep',
+    'i need extra iron',
+    // A goal clause: "to" before a word that isn't filler, or getting more or some of something
+    'a pill to sleep',
+    'supplement to sleep',
+    'something to sleep',
+    'to get more sleep',
+    'get more energy',
+    'get some sleep',
+    'get more greens',
+    'i need extra support',
+    // A customer describing themselves, not naming a product
+    "I'm a woman over 50",
+    'im pregnant',
+    'im a man',
+    "i'm 52",
+    "I'm perimenopausal",
+    "I'm breastfeeding",
+    'i am a man over 50',
+    "i've been feeling tired",
+    'ive been stressed',
+    "i can't sleep",
+    'i feel stressed',
+    'trying to sleep',
+    // Only a nutrient a product contains
+    'dha',
+    'epa',
+    'dha and epa',
+    'protein',
+    'protein 50+',
+    'more protein',
+    // A nutrient before what it is for names no product either
+    'protein for pregnancy',
+    'I want protein for pregnancy',
+    'I need protein for pregnancy',
+    'extra protein for pregnancy',
+    "I'd like protein for pregnancy",
+    'protein for pregnancy and postpartum',
+    'protein for postpartum',
+    'protein in pregnancy',
+    'dha for pregnancy',
+    'protein for my wife',
+    // Only what a product is for, never its name
+    'i need relief',
+    'i want relief',
+    'i need support',
+    'i want support',
+    'i need health',
+    'relief',
+    'support',
+  ];
+  // Symptom, need and goal wording that no marker above catches: each has a word that names no product
+  // sold here, so it is never searched (the search would rank the related product first)
+  const UNNAMED_QUERIES = [
+    ["I'm stressed", '114'],
+    ['i feel stressed', '114'],
+    ['anxiety', '114'],
+    ['calm', '114'],
+    ['to relax', '114'],
+    ['what can i take for stress', '114'],
+    ["i can't sleep", '113'],
+    ['cant fall asleep', '113'],
+    ['i keep waking up at night', '113'],
+    ['insomnia', '113'],
+    ['sleep aid', '113'],
+    ['what do you have for sleep', '113'],
+    ['top pick for sleep', '113'],
+    ['feeling tired all the time', '115'],
+    ['i want more energy', '115'],
+    ['i need more energy', '115'],
+    ['fatigue', '115'],
+    ['low energy', '115'],
+    ['low iron', '115'],
+    ["I'm pregnant", '105'],
+    ["I'm trying to get pregnant", '119'],
+    ['to get pregnant', '119'],
+    ['trying to conceive', '119'],
+    ['ttc', '119'],
+    ['infertility', '119'],
+    ['I have infertility', '119'],
+    ['infertility support', '119'],
+    ['add the infertility one', '119'],
+    ['asleep', '113'],
+    ['hot flashes', '120'],
+    ['menopause', '120'],
+    ['im perimenopausal', '120'],
+    ['perimenopausal', '120'],
+    ['gut health', '111'],
+    ['bloating', '111'],
+    ['probiotic for bloating', '111'],
+    ['hair loss', '117'],
+    ['dry skin', '117'],
+    ['build muscle', '118'],
+    ['leg cramps', '116'],
+    ['brain health', '112'],
+  ];
+
+  test('need and goal wording matches nothing, by name or by search, and never searches', async () => {
+    const { client, catalog } = matchClient({ search: () => searchRecords(['7112', '7113']) });
+    for (const query of NEED_QUERIES) {
+      assert.equal(describesNeed(query), true, query);
+      assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'help me sleep' });
+    assert.match(result.content[0].text, /No product matching "help me sleep" can be added here; hand off to a support agent/);
+  });
+
+  test('wording with a word that names no product is never searched, so the search never picks one for it', async () => {
+    for (const [query, related] of UNNAMED_QUERIES) {
+      assert.deepEqual(await matchLive(query, [related]), { match: 'none', titles: [], searched: false }, query);
+    }
+    const { client, catalog } = matchClient({ search: () => searchRecords(['7112', '7113']) });
+    for (const query of ['for my anxiety', 'i want more energy', 'to get pregnant', 'I need a supplement for stress']) {
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query });
+      assert.equal(result.content[0].text, `No product matching "${query}" can be added here; hand off to a support agent.`, query);
+    }
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('product names are still matched', async () => {
+    const { client } = matchClient();
+    for (const [query, expected] of [
+      ['Sleep', [8114]],
+      ['add sleep', [8114]],
+      ['Essential for Women 18+', [8101, 8102]],
+      ['Essential for Women', [8101, 8102, 8103]],
+      ['multi for men', [8104, 8105]],
+      ['Daily Shake for pregnancy', [8110]],
+      ['protein shake for pregnancy', [8110]],
+      ['the shake in vanilla for pregnancy', [8110]],
+    ]) {
+      assert.equal(describesNeed(query), false, query);
+      assert.deepEqual(variantIds(await client.findAddableProducts(query, EMAIL)), expected, query);
+    }
+    const variants = ['Stress Relief', 'Fertility Support', 'Perimenopause Health'].map((productTitle, index) =>
+      ({ variantId: String(index + 1), productId: String(index + 1), productTitle, variantTitle: 'Default Title' }));
+    for (const [index, { productTitle }] of variants.entries()) {
+      assert.equal(describesNeed(productTitle), false, productTitle);
+      assert.deepEqual(await matchAddableVariants(productTitle, variants), { match: 'name', variants: [variants[index]] }, productTitle);
+    }
+    for (const { productTitle } of LIVE_VARIANTS) {
+      assert.equal(describesNeed(productTitle), false, productTitle);
+    }
+  });
+
+  test('ingredient wording names no product: nothing, and never searched (decision 2026-10-29)', async () => {
+    // The search ranks the product with that ingredient first, as the live store does
+    for (const [query, related] of [
+      ['fish oil', '112'], ['fish', '112'], ['oil', '112'], ['omega oil', '112'], ['melatonin', '113'], ['ceramides', '117'],
+      ['ceramide', '117'], ['vitamin d', '102'], ['zinc', '103'], ['collagen', '117'], ['folate', '105'], ['magnesium glycinate', '116'],
+      ['dha', '112'], ['epa', '112'], ['dha epa', '112'], ['protein', '107'], ['need more protein', '107'], ['i need more protein', '107'],
+      // A nutrient before what it is for: the search would rank Daily Shake Pregnancy & Postpartum first
+      ['protein for pregnancy', '109'], ['protein for postpartum', '109'], ['more protein for pregnancy', '109'],
+      ['protein in pregnancy', '109'],
+    ]) {
+      assert.deepEqual(await matchLive(query, [related]), { match: 'none', titles: [], searched: false }, query);
+    }
+    // A product named for what it contains, or an ingredient word next to its name, is still that product
+    for (const [query, expected] of [
+      ['magnesium', 'Magnesium+ [Default Title]'],
+      ['iron', 'Iron [Default Title]'],
+      ['omega 3', 'Omega-3 DHA & EPA [Default Title]'],
+      ['omega 3 dha', 'Omega-3 DHA & EPA [Default Title]'],
+      ['omega-3 dha & epa', 'Omega-3 DHA & EPA [Default Title]'],
+      ['creatine', 'Creatine Greens [Default Title]'],
+      ['choline', 'Natal Choline [Default Title]'],
+    ]) {
+      const result = await matchLive(query);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(result.titles, [expected], query);
+    }
+    // "protein" next to another word of Daily Shake is still searched
+    assert.deepEqual(await matchLive('protein powder', ['108']), { match: 'interpreted', titles: ['Daily Shake [Chocolate]'], searched: true });
+  });
+
+  test('a quantity after "add", "order" or an asked "get" is how much to add, and a frame before "add" is not a state', async () => {
+    for (const [query, expected] of [
+      ['add one more iron', 'Iron [Default Title]'],
+      ['add more magnesium', 'Magnesium+ [Default Title]'],
+      ['order some more sleep', 'Sleep [Default Title]'],
+      ['get me the iron please', 'Iron [Default Title]'],
+      ['can I get some creatine greens', 'Creatine Greens [Default Title]'],
+      ['could i get more iron', 'Iron [Default Title]'],
+      ["I'd like to add Magnesium+", 'Magnesium+ [Default Title]'],
+      ["I'd like to try the sleep", 'Sleep [Default Title]'],
+      ["I'm looking to add sleep", 'Sleep [Default Title]'],
+      ["i'm going to add some iron", 'Iron [Default Title]'],
+      ['please add sleep to my subscription', 'Sleep [Default Title]'],
+      ['add iron to my next shipment too', 'Iron [Default Title]'],
+      // "for my" before only filler is where the add goes, not a need
+      ['add sleep for my next order', 'Sleep [Default Title]'],
+      ['add sleep for my order', 'Sleep [Default Title]'],
+      ['add iron for my next shipment', 'Iron [Default Title]'],
+      ['add iron for my subscription', 'Iron [Default Title]'],
+      ['add magnesium for my subscription', 'Magnesium+ [Default Title]'],
+      ['please add synbiotic for my next box', 'Synbiotic+ [Default Title]'],
+    ]) {
+      assert.equal(describesNeed(query), false, query);
+      const result = await matchLive(query);
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual(result.titles, [expected], query);
+    }
+  });
+
+  test('add requests in customers\' own words find the product they named', async () => {
+    // [query, ranking for a query no title matches, first product title]
+    for (const [query, ranking, expected] of [
+      ['can you add Iron', [], 'Iron'],
+      ["I'd like to add Magnesium+ to my next order", [], 'Magnesium+'],
+      ['add 2 daily shakes chocolate', [], 'Daily Shake'],
+      ['I want to add the omega', [], 'Omega-3 DHA & EPA'],
+      ['omega 3', [], 'Omega-3 DHA & EPA'],
+      ['please add sleep to my subscription', [], 'Sleep'],
+      ["add women's 50+", [], 'Women’s Multivitamin 50+'],
+      ['could I also get synbiotic', [], 'Synbiotic+'],
+      ['add natalbiotic', [], 'Natalbiotic™'],
+      ['add the prenatal mint', [], 'Prenatal Multivitamin'],
+      ['I want Stress Relief too', [], 'Stress Relief'],
+      ['can I get some creatine greens', [], 'Creatine Greens'],
+      ['add one more iron', [], 'Iron'],
+      ['I want to add another bottle of HyaCera', [], 'HyaCera™'],
+      ['i need to add my prenatal', [], 'Prenatal Multivitamin'],
+      ["I'd like the essential for women 18+", [], 'Women’s Multivitamin 18+'],
+      ['Essential Protein Daily Shake', [], 'Daily Shake'],
+      ['protein shake', [], 'Daily Shake'],
+      ['protein powder', ['107'], 'Daily Shake'],
+      ['chocolate protein', ['108'], 'Daily Shake'],
+      ['probiotic', ['111'], 'Synbiotic+'],
+      ['prenatal probiotic', ['110'], 'Natalbiotic™'],
+      ["add the men's multi", [], 'Men’s Multivitamin 18+'],
+      ['mens 50 plus', [], 'Men’s Multivitamin 50+'],
+      ['fertility support please', [], 'Fertility Support'],
+      ['perimenopause', [], 'Perimenopause Health'],
+      ['natal choline', [], 'Natal Choline'],
+      ['postnatal', [], 'Postnatal Multivitamin'],
+      ['multivitamn', [], 'Prenatal Multivitamin'],
+      ['the shake for pregnancy', [], 'Daily Shake Pregnancy & Postpartum'],
+      ['Daily Shake Pregnancy & Postpartum', [], 'Daily Shake Pregnancy & Postpartum'],
+      ['vanilla shake', [], 'Daily Shake'],
+      ['add more magnesium', [], 'Magnesium+'],
+      ["i want the women's multivitamin", [], 'Women’s Multivitamin 18+'],
+      ['get me the iron please', [], 'Iron'],
+      ['can i also have the sleep one', [], 'Sleep'],
+      ["add 2 women's multivitamin 18+", [], 'Women’s Multivitamin 18+'],
+      ['add 2 omega 3', [], 'Omega-3 DHA & EPA'],
+      ['add two bottles of iron', [], 'Iron'],
+      ['add a prenatal for my wife', [], 'Prenatal Multivitamin'],
+      ['peri-menopause', [], 'Perimenopause Health'],
+      ['prenatal mint flavor', [], 'Prenatal Multivitamin'],
+    ]) {
+      assert.equal(describesNeed(query), false, query);
+      const result = await matchLive(query, ranking);
+      assert.equal(result.match, ranking.length > 0 ? 'interpreted' : 'name', query);
+      assert.ok(result.titles.length > 0 && result.titles[0].startsWith(`${expected} [`), `${query}: ${result.titles[0]}`);
+    }
+  });
+
+  test('a count, a flavor word and who an add is for are not product words; "peri-menopause" is one word', async () => {
+    for (const [query, expected] of [
+      // A count is how many to add, never an age band, whatever the title's numbers
+      ["add 2 women's multivitamin 18+", ['Women’s Multivitamin 18+ [Mint]', 'Women’s Multivitamin 18+ [Citrus]']],
+      ["add 2 men's 50+", ['Men’s Multivitamin 50+ [Default Title]']],
+      ["I'd like 2 of the men's 18+", ['Men’s Multivitamin 18+ [Default Title]']],
+      ["add 2 bottles of women's 50+", ['Women’s Multivitamin 50+ [Default Title]']],
+      ['add 2 omega 3', ['Omega-3 DHA & EPA [Default Title]']],
+      ['2 omega-3 please', ['Omega-3 DHA & EPA [Default Title]']],
+      ['omega three', ['Omega-3 DHA & EPA [Default Title]']],
+      ['add two bottles of iron', ['Iron [Default Title]']],
+      ['add two sleep', ['Sleep [Default Title]']],
+      ['add three daily shakes', ['Daily Shake [Vanilla]', 'Daily Shake [Chocolate]', 'Daily Shake Pregnancy & Postpartum [Vanilla]']],
+      ['iron x2', ['Iron [Default Title]']],
+      ['add 1x iron', ['Iron [Default Title]']],
+      ['qty 2 magnesium', ['Magnesium+ [Default Title]']],
+      // Age bands are still numbers to match
+      ['50 women', ['Women’s Multivitamin 50+ [Default Title]']],
+      ['add 18 womens', ['Women’s Multivitamin 18+ [Mint]', 'Women’s Multivitamin 18+ [Citrus]']],
+      // Flavor words
+      ['prenatal mint flavor', ['Prenatal Multivitamin [Mint]']],
+      ['citrus flavour prenatal', ['Prenatal Multivitamin [Citrus]']],
+      ['the mint flavored prenatal', ['Prenatal Multivitamin [Mint]']],
+      ["women's 18+ mint flavor", ['Women’s Multivitamin 18+ [Mint]']],
+      ['add the chocolate flavor daily shake', ['Daily Shake [Chocolate]']],
+      ['add the prenatal in citrus', ['Prenatal Multivitamin [Citrus]']],
+      ["add the women's multivitamin in citrus", ['Women’s Multivitamin 18+ [Citrus]']],
+      // Who it is for: never read as men or women, so only the product named
+      ["add a men's multi for my husband", ['Men’s Multivitamin 18+ [Default Title]', 'Men’s Multivitamin 50+ [Default Title]']],
+      ['add a prenatal for my wife', ['Prenatal Multivitamin [Citrus]', 'Prenatal Multivitamin [Mint]']],
+      ['add iron for my daughter', ['Iron [Default Title]']],
+      ['add the sleep for my husband', ['Sleep [Default Title]']],
+      ['sleep for my wife', ['Sleep [Default Title]']],
+      ['add iron for my sister', ['Iron [Default Title]']],
+      ['add the prenatal for my sister', ['Prenatal Multivitamin [Citrus]', 'Prenatal Multivitamin [Mint]']],
+      ["add a men's multi for my brother", ['Men’s Multivitamin 18+ [Default Title]', 'Men’s Multivitamin 50+ [Default Title]']],
+      ['add iron for my friend', ['Iron [Default Title]']],
+      ['add sleep for my grandma', ['Sleep [Default Title]']],
+      ['add iron for my teen', ['Iron [Default Title]']],
+      // A possessive after "my" names who it is for too
+      ["add my wife's prenatal", ['Prenatal Multivitamin [Citrus]', 'Prenatal Multivitamin [Mint]']],
+      ["add my daughter's iron", ['Iron [Default Title]']],
+      ["I'd like to add my mom's women's 50+", ['Women’s Multivitamin 50+ [Default Title]']],
+      // "peri" and "menopause" join into the title word
+      ['peri-menopause', ['Perimenopause Health [Default Title]']],
+      ['peri menopause', ['Perimenopause Health [Default Title]']],
+      ['Peri-Menopause Health', ['Perimenopause Health [Default Title]']],
+    ]) {
+      assert.equal(describesNeed(query), false, query);
+      assert.deepEqual(await matchLive(query), { match: 'name', titles: expected, searched: false }, query);
+    }
+    // Every multivitamin, never only Men's for "my husband"
+    assert.equal((await matchLive('add the multivitamin for my husband')).titles.length, 9);
+    // A need for that person, or the condition word alone, is still nothing
+    for (const [query, related] of [['iron for my anemia', '115'], ['menopause', '120'], ['peri-menopausal', '120'], ['for my sister', '115']]) {
+      assert.deepEqual(await matchLive(query, [related]), { match: 'none', titles: [], searched: false }, query);
+    }
+  });
+});
+
+describe('find_addable_product interpreted by the storefront search', () => {
+  test('search runs only when no title matches, with the query, country and top-K limit', async () => {
+    const { client, catalog } = matchClient({ answers: { 'protein powder': ['7106'] } });
+    await client.findAddableProducts('prenatal', EMAIL);
+    assert.equal(catalog.searches.length, 0);
+
+    const result = await client.findAddableProducts('  protein   powder ', EMAIL);
+    assert.equal(result.match, 'interpreted');
+    assert.deepEqual(variantIds(result), [8108]);
+    assert.equal(catalog.searches.length, 1);
+    const [{ url, init, body }] = catalog.searches;
+    assert.equal(url, UCP_URL);
+    assert.equal(init.redirect, 'error');
+    assert.deepEqual(body.params.arguments, {
+      meta: { 'ucp-agent': { profile: PROFILE_URL } },
+      catalog: { query: 'protein powder', context: { address_country: 'US' }, pagination: { limit: INTERPRETED_SEARCH_DEPTH } },
+    });
+  });
+
+  test("only allowlisted products, in Shopify's rank order, and only the first one's title", async () => {
+    // A bundle ranks first; Daily Shake Pregnancy & Postpartum is a different product than the first addable one
+    const { client } = matchClient({ answers: { 'protein powder': ['7203', '7107', '7108', '7106'] } });
+    const result = await client.findAddableProducts('protein powder', EMAIL);
+    assert.equal(result.match, 'interpreted');
+    // Chocolate before vanilla, as ranked (the allowlist lists vanilla first)
+    assert.deepEqual(variantIds(result), [8109, 8108]);
+  });
+
+  test(`only the top ${INTERPRETED_SEARCH_DEPTH} raw results count`, async () => {
+    const notAddable = MATCH_NOT_ADDABLE.map(([id]) => id);
+    assert.equal(notAddable.length, INTERPRETED_SEARCH_DEPTH);
+    // The stub ignores the requested limit and returns six results
+    const late = matchClient({ answers: { probiotic: [...notAddable, '7111'] } });
+    assert.deepEqual(await late.client.findAddableProducts('probiotic', EMAIL), { match: 'none', products: [] });
+    const inWindow = matchClient({ answers: { probiotic: [...notAddable.slice(1), '7111'] } });
+    assert.deepEqual(variantIds(await inWindow.client.findAddableProducts('probiotic', EMAIL)), [8113]);
+  });
+
+  test(`at most ${INTERPRETED_MAX_PRODUCTS} products`, async () => {
+    const { client } = matchClient({ answers: { 'protein powder': ['7106', '7107', '7115', '7116'] } });
+    const result = await client.findAddableProducts('protein powder', EMAIL);
+    assert.deepEqual(variantIds(result), [8108, 8109, 8117]);
+  });
+
+  test('a product the customer named that cannot be added returns nothing, not a substitute', async () => {
+    const { client } = matchClient({
+      answers: {
+        'the shaker': ['7202', '7106'],
+        'Prenatal Essential Support Ritual': ['7201', '7105'],
+        'prenatal probiotic': ['7201', '7110'],
+      },
+    });
+    assert.deepEqual(await client.findAddableProducts('the shaker', EMAIL), { match: 'none', products: [] });
+    assert.deepEqual(await client.findAddableProducts('Prenatal Essential Support Ritual', EMAIL), { match: 'none', products: [] });
+    // A bundle ranked first that the customer didn't name doesn't block the addable product after it
+    const result = await client.findAddableProducts('prenatal probiotic', EMAIL);
+    assert.equal(result.match, 'interpreted');
+    assert.deepEqual(variantIds(result), [8112]);
+    // A product that isn't allowlisted with every searched word in its title, ranked above one they fit by alias
+    const allowlisted = new Set(LIVE_PRODUCTS.map(([productId]) => productId));
+    for (const [query, ranking] of [
+      ['probiotic', [['900', 'Probiotic Travel Pack'], ['111', 'Synbiotic+']]],
+      ['protein powder', [['901', 'Protein Powder Sample'], ['107', 'Daily Shake']]],
+    ]) {
+      const search = async () => ranking.map(([productId, title]) => ({ productId, title }));
+      assert.deepEqual(await matchAddableVariants(query, LIVE_VARIANTS, { search, allowlisted }), { match: 'none', variants: [] }, query);
+    }
+  });
+
+  test('an unreadable or untitled result ranked above every addable one is nothing, never the next product', async () => {
+    const variants = [{ variantId: '1', productId: '10', productTitle: 'Synbiotic+', variantTitle: 'Default Title' }];
+    const synbiotic = { productId: '10', title: 'Synbiotic+' };
+    for (const top of [null, {}, { productId: 'gid://shopify/Product/999', title: 'Probiotic' }, { productId: '999' }, { productId: '999', title: ' ' }]) {
+      const search = async () => [top, synbiotic];
+      assert.deepEqual(await matchAddableVariants('probiotic', variants, { search }), { match: 'none', variants: [] }, JSON.stringify(top));
+    }
+    // After a kept product it is skipped
+    assert.equal((await matchAddableVariants('probiotic', variants, { search: async () => [synbiotic, null] })).match, 'interpreted');
+    // Through the client, a malformed entry ranked first fails the search
+    for (const top of [
+      { id: '999', title: 'Protein Powder Sampler' },
+      { id: 'gid://shopify/ProductBundle/999', title: 'Protein Powder Sampler' },
+      { id: 'gid://shopify/Product/999' },
+      null,
+    ]) {
+      const { client, catalog } = matchClient({ search: () => [top, ...searchRecords(['7106'])] });
+      assert.deepEqual(await client.findAddableProducts('protein powder', EMAIL), { match: 'none', products: [] }, JSON.stringify(top));
+      assert.equal(catalog.searches.length, 1);
+    }
+  });
+
+  test('an allowlisted product ranked first that can\'t be sold now is nothing, never the next product', async () => {
+    for (const [label, change] of [
+      ['out of stock', variant => { variant.availability.available = false; }],
+      ['priced in another currency', variant => { variant.price.currency = 'EUR'; }],
+    ]) {
+      // Vanilla Daily Shake is ranked first for "protein powder", Synbiotic+ for "probiotic"; the product after each
+      // also fits the words
+      for (const [query, unsellable, ranking] of [['protein powder', '8108', ['7106', '7107']], ['probiotic', '8113', ['7111', '7110']]]) {
+        const { client, catalog } = matchClient({ catalogDb: matchCatalogDbWith(unsellable, change), answers: { [query]: ranking } });
+        assert.deepEqual(await client.findAddableProducts(query, EMAIL), { match: 'none', products: [] }, `${label}: ${query}`);
+        assert.equal(catalog.searches.length, 1, `${label}: ${query}`);
+      }
+    }
+    // In stock, the first one is returned
+    const { client } = matchClient({ answers: { probiotic: ['7111', '7110'] } });
+    assert.deepEqual(variantIds(await client.findAddableProducts('probiotic', EMAIL)), [8113]);
+    // Ranked after a kept product, one that can't be added (allowlisted, or named by the query) is skipped.
+    // The catalog read 900 as out of stock (an allowlisted product with no title read stops the search)
+    const allowlisted = new Set([...LIVE_PRODUCTS.map(([productId]) => productId), '900']);
+    const shakes = LIVE_VARIANTS.filter(variant => variant.productId !== '108');
+    const unsellable = [
+      ...LIVE_VARIANTS.filter(variant => variant.productId === '108'),
+      { variantId: '9000', productId: '900', productTitle: 'Travel Pack', variantTitle: 'Default Title' },
+    ];
+    for (const after of [{ productId: '108', title: 'Daily Shake' }, { productId: '900', title: 'Protein Powder Sampler' }, { productId: '901', title: 'Protein Powder Sampler' }]) {
+      const search = async () => [{ productId: '107', title: 'Daily Shake' }, after];
+      assert.deepEqual((await matchAddableVariants('protein powder', shakes, { search, allowlisted, unsellable })).variants.map(variant => variant.variantId),
+        ['1070'], JSON.stringify(after));
+      // Ranked first, it is nothing
+      const first = async () => [after, { productId: '107', title: 'Daily Shake' }];
+      assert.deepEqual(await matchAddableVariants('protein powder', shakes, { search: first, allowlisted, unsellable }), { match: 'none', variants: [] }, JSON.stringify(after));
+    }
+  });
+
+  test('with nothing sellable, nothing is searched', async () => {
+    let searched = false;
+    const search = async () => { searched = true; return liveRanking(['111']); };
+    for (const query of ['probiotic', 'protein powder', 'sleep']) {
+      assert.deepEqual(await matchAddableVariants(query, [], { search }), { match: 'none', variants: [] }, query);
+      assert.deepEqual(await matchAddableVariants(query, [], { search, unsellable: LIVE_VARIANTS }), { match: 'none', variants: [] }, query);
+    }
+    assert.equal(searched, false);
+  });
+
+  test('a flavor asked for that only the top product\'s unsellable listing has is nothing, never another product in it', async () => {
+    // Daily Shake as one product with Vanilla out of stock, or with each flavor its own listing and Vanilla's
+    // hidden from the search
+    const oneProduct = LIVE_VARIANTS.map(variant => (variant.productId === '108' ? { ...variant, productId: '107' } : variant));
+    const vanilla = oneProduct.filter(variant => variant.variantId === '1070');
+    for (const [label, variants, unsellable, ranking] of [
+      ['one product', oneProduct.filter(variant => variant.variantId !== '1070'), vanilla, [['107', 'Daily Shake'], ['109', 'Daily Shake Pregnancy & Postpartum']]],
+      ['separate listings', LIVE_VARIANTS.filter(variant => variant.productId !== '107'), LIVE_VARIANTS.filter(variant => variant.productId === '107'),
+        [['108', 'Daily Shake'], ['109', 'Daily Shake Pregnancy & Postpartum']]],
+    ]) {
+      const search = async () => ranking.map(([productId, title]) => ({ productId, title }));
+      const allowlisted = new Set([...variants, ...unsellable].map(variant => variant.productId));
+      for (const query of ['vanilla protein powder', 'protein powder vanilla', 'vanilla essential protein']) {
+        assert.deepEqual(await matchAddableVariants(query, variants, { search, allowlisted, unsellable }), { match: 'none', variants: [] }, `${label}: ${query}`);
+      }
+      // A flavor it does have is still that product
+      assert.deepEqual((await matchAddableVariants('chocolate protein powder', variants, { search, allowlisted, unsellable })).variants.map(variant => variant.variantTitle),
+        ['Chocolate'], label);
+    }
+  });
+
+  test('an addable product ranked first that doesn\'t fit the words is nothing, never the next one', async () => {
+    for (const [query, ranking] of [['protein pregnancy', ['117', '109']], ['powder', ['117', '109']], ['prenatal probiotic', ['101', '110']]]) {
+      assert.deepEqual(await matchLive(query, ranking), { match: 'none', titles: [], searched: true }, query);
+    }
+    assert.equal((await matchLive('protein pregnancy', ['109'])).match, 'interpreted');
+  });
+
+  test('a product named only by its unsellable listings is nothing and never searched', async () => {
+    // Prenatal Multivitamin out of stock: "prenatal" is never searched, where Natalbiotic would be found by alias
+    for (const query of ['prenatal', 'pre natal', 'Essential Prenatal']) {
+      assert.deepEqual(await matchLive(query, ['110'], ['105']), { match: 'none', titles: [], searched: false }, query);
+    }
+  });
+
+  test('an allowlisted product the catalog returned nothing for is never swapped for a sibling a partial name matches', async () => {
+    const allowlisted = new Set(LIVE_PRODUCTS.map(([productId]) => productId));
+    const without = gone => LIVE_VARIANTS.filter(variant => !gone.includes(variant.productId));
+    let searched = false;
+    const search = async () => { searched = true; return liveRanking(['109']); };
+    // Daily Shake (both flavors) or Women's Multivitamin 18+ not_found: their titles are unknown, so a partial name may mean them
+    for (const [query, gone] of [
+      ['daily shake', ['107', '108']],
+      ['shake', ['107', '108']],
+      ['vanilla shake', ['107', '108']],
+      ['womens multivitamin', ['101']],
+      ['multivitamin 50+', ['101']],
+      ['sleep', ['113']],
+      // Nor is anything searched: the unknown product isn't in the results to stop a sibling found by alias
+      ['prenatal', ['105']],
+      ['Essential Prenatal', ['105']],
+      ['pre natal', ['105']],
+      ['protein powder', ['107', '108']],
+      ['essential protein', ['107', '108']],
+      ['vanilla protein powder', ['107', '108']],
+    ]) {
+      assert.deepEqual(await matchAddableVariants(query, without(gone), { search, allowlisted }), { match: 'none', variants: [] }, query);
+    }
+    assert.equal(searched, false);
+    // A query naming every word of a title it matches is that product, whatever else is unknown
+    for (const [query, gone, expected] of [
+      ['daily shake pregnancy & postpartum', ['107', '108'], ['109']],
+      ['daily shake pregnancy postpartum', ['107', '108'], ['109']],
+      ["women's multivitamin 50+", ['101'], ['102']],
+      ['iron', ['107', '108'], ['115']],
+      // The other flavor's listing is not unknown: same title, so Daily Shake is fully named
+      ['daily shake', ['107'], ['108', '109']],
+    ]) {
+      const result = await matchAddableVariants(query, without(gone), { search, allowlisted });
+      assert.equal(result.match, 'name', query);
+      assert.deepEqual([...new Set(result.variants.map(variant => variant.productId))], expected, query);
+    }
+    // "natal" is a whole word of Natal Choline but only the start of Natalbiotic, so with Natal Choline unknown
+    // or out of stock it is never Natalbiotic; with both sellable they rank alike, in allowlist order
+    for (const query of ['natal', 'add the natal']) {
+      assert.deepEqual(await matchAddableVariants(query, without(['121']), { search, allowlisted }), { match: 'none', variants: [] }, query);
+      assert.deepEqual(await matchLive(query, ['110'], ['121']), { match: 'none', titles: [], searched: false }, query);
+    }
+    assert.deepEqual((await matchLive('natal')).titles, ['Natalbiotic™ [Default Title]', 'Natal Choline [Default Title]']);
+    assert.equal((await matchLive('natal', [], ['110'])).match, 'none');
+    // A prefix that is the only product it starts still matches it
+    assert.equal((await matchAddableVariants('magnes', LIVE_VARIANTS, { search, allowlisted })).match, 'name');
+    // Without an allowlist (or with every allowlisted title read) a partial name matches as before
+    assert.equal((await matchAddableVariants('daily shake', without(['107', '108']), { search })).match, 'name');
+    assert.equal((await matchAddableVariants('daily shake', LIVE_VARIANTS, { search, allowlisted })).match, 'name');
+
+    // Through the client, a lookup missing every Daily Shake variant (not_found) fails closed, and so does
+    // the same partial lookup read back from the cache
+    const catalogDb = matchCatalogDb();
+    for (const country of Object.keys(catalogDb)) {
+      catalogDb[country] = catalogDb[country].filter(product => !['7106', '7107', '7115', '7116'].includes(product.id.split('/').pop()));
+    }
+    const { client, catalog } = matchClient({ catalogDb, answers: { 'daily shake': ['7106', '7108'] } });
+    for (const attempt of [1, 2]) {
+      assert.deepEqual(await client.findAddableProducts('daily shake', EMAIL), { match: 'none', products: [] }, String(attempt));
+    }
+    assert.deepEqual(variantIds(await client.findAddableProducts('daily shake pregnancy & postpartum', EMAIL)), [8110]);
+    // One lookup (two chunks of IDs), then cache hits
+    assert.equal(catalog.requests.length, 2);
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('flavor and size words narrow interpreted products; a different size is nothing', async () => {
+    const { client } = matchClient({ answers: { 'chocolate protein powder': ['7106', '7107'], 'synbiotic 90 servings': ['7111'] } });
+    // Vanilla Daily Shake ranked first, but only the chocolate listing has the flavor asked for
+    const chocolate = await client.findAddableProducts('chocolate protein powder', EMAIL);
+    assert.equal(chocolate.match, 'interpreted');
+    assert.deepEqual(variantIds(chocolate), [8109]);
+    assert.deepEqual(await client.findAddableProducts('synbiotic 90 servings', EMAIL), { match: 'none', products: [] });
+  });
+
+  test('a product line, flavor or other word the kept product lacks is nothing, never the search\'s top pick', async () => {
+    for (const [query, ranking] of [
+      ['postpartum vitamins', ['105', '106']],
+      ['post partum multivitamin', ['105', '106']],
+      ['prenatal shake', ['107', '109']],
+      ['chocolate daily shake pregnancy', ['108', '109']],
+      ['chocolate daily shake pregnancy', ['109', '108']],
+      ['mint daily shake', ['107', '108']],
+      ['magnesium for sleep', ['113', '116']],
+      ['sleep stress', ['116', '113', '114']],
+      ['probiotic sleep', ['111']],
+    ]) {
+      assert.deepEqual(await matchLive(query, ranking), { match: 'none', titles: [], searched: true }, `${query} ${ranking}`);
+    }
+    for (const [query, ranking, expected] of [
+      ['prenatal probiotic', ['110'], ['Natalbiotic™ [Default Title]']],
+      ['Essential Protein', ['109', '107'], ['Daily Shake Pregnancy & Postpartum [Vanilla]']],
+      ['chocolate protein powder', ['109', '107', '108'], ['Daily Shake [Chocolate]']],
+    ]) {
+      assert.deepEqual(await matchLive(query, ranking), { match: 'interpreted', titles: expected, searched: true }, query);
+    }
+    // With the fixture catalog's strawberry Daily Shake, "strawberry" is a flavor Prenatal Multivitamin lacks
+    const { client } = matchClient({ answers: { 'strawberry prenatal vitamins': ['7105', '7115'] } });
+    assert.deepEqual(await client.findAddableProducts('strawberry prenatal vitamins', EMAIL), { match: 'none', products: [] });
+  });
+
+  test('a product contradicting the query\'s numbers, ranked above every addable one, means nothing is returned', async () => {
+    const { client, catalog } = matchClient({
+      answers: {
+        "mint women's multivitamin 50+": ['7101', '7102', '7105'],
+        'citrus mens multi 50+': ['7103', '7104', '7105'],
+      },
+    });
+    // Never falls through to Prenatal Multivitamin, which has no number to contradict
+    assert.deepEqual(await client.findAddableProducts("mint women's multivitamin 50+", EMAIL), { match: 'none', products: [] });
+    assert.deepEqual(await client.findAddableProducts('citrus mens multi 50+', EMAIL), { match: 'none', products: [] });
+    assert.equal(catalog.searches.length, 2);
+    // A number no title has is never searched
+    assert.deepEqual(await client.findAddableProducts('mens multi 40+', EMAIL), { match: 'none', products: [] });
+    assert.equal(catalog.searches.length, 2);
+  });
+
+  test('gender words never fuzz or cross in an interpreted match', async () => {
+    const { client } = matchClient({
+      answers: { "men's prenatal": ['7105', '7103'], 'mens multi pack daily': ['7101', '7103'], 'womens multi pack daily': ['7101', '7103'] },
+    });
+    assert.deepEqual(queryWords("men's prenatal"), ['men', 'prenatal']);
+    assert.deepEqual(await client.findAddableProducts("men's prenatal", EMAIL), { match: 'none', products: [] });
+    // A women's product ranked first for a men's query is a contradiction, not a substitute; for a women's
+    // query "daily" names another product, which the women's one lacks
+    assert.deepEqual(await client.findAddableProducts('mens multi pack daily', EMAIL), { match: 'none', products: [] });
+    assert.deepEqual(await client.findAddableProducts('womens multi pack daily', EMAIL), { match: 'none', products: [] });
+  });
+
+  test('the search is never cached: a repeated query searches again', async () => {
+    const { client, catalog } = matchClient({ answers: { probiotic: ['7111'] } });
+    for (const attempt of [1, 2]) {
+      const result = await client.findAddableProducts('probiotic', EMAIL);
+      assert.equal(result.match, 'interpreted');
+      assert.equal(catalog.searches.length, attempt);
+    }
+  });
+
+  test('the description and the interpreted text tell Fin to confirm by product name and never suggest', async () => {
+    const { description } = toolByName('find_addable_product');
+    assert.match(description, /The query is the product name exactly as the customer said it \(an old name, abbreviation, flavor or misspelling is fine\)/);
+    assert.match(description, /never a symptom, need or goal/);
+    assert.match(description, /confirm an interpreted product with the customer by its product name only, before quoting a price or making any change/);
+    assert.match(description, /Never list or offer products the customer didn't name/);
+    assert.match(description, /Never describe what a product does or make any health, ingredient or benefit claim/);
+
+    const { client } = matchClient({ answers: { probiotic: ['7111'] } });
+    const [{ text }] = (await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'probiotic' })).content;
+    assert.match(text, /this is the product the store matched to the customer's words/);
+    assert.match(text, /Confirm it with the customer by its product name only, without describing it or giving any reason or benefit, before quoting a price or making any change/);
+    assert.match(text, /Do not offer any other product or search result as a suggestion/);
+    assert.doesNotMatch(text, /closest/);
+  });
+
+  test('price, currency and variants come from the catalog lookup in the subscribed currency, never the search', async () => {
+    const us = matchClient({ answers: { probiotic: ['7111'] } });
+    assert.deepEqual(await us.client.findAddableProducts('probiotic', EMAIL), {
+      match: 'interpreted',
+      products: [{ variant_id: 8113, title: 'Synbiotic+', variant_title: '30 servings', unit_price: '61.36', currency: 'USD', can_subscribe: false }],
+    });
+
+    const ca = matchClient({ db: withCountry('CA'), answers: { probiotic: ['7111'] } });
+    const [first] = (await ca.client.findAddableProducts('probiotic', EMAIL)).products;
+    assert.deepEqual([first.unit_price, first.currency], ['92.04', 'CAD']);
+    assert.equal(ca.catalog.searches[0].body.params.arguments.catalog.context.address_country, 'CA');
+  });
+
+  test('a search failure, timeout or malformed answer is no match, never an error, and never blocks name matches', async () => {
+    const rpcBody = (body, result) => jsonResponse({ jsonrpc: '2.0', id: body.id, result });
+    for (const [label, search, timeoutMs] of [
+      ['HTTP 500', () => new Response('nope', { status: 500 })],
+      ['HTTP 429', () => new Response('Too Many Requests', { status: 429 })],
+      ['network error', () => { throw new TypeError('fetch failed'); }],
+      ['JSON-RPC error', (query, body) => jsonResponse({ jsonrpc: '2.0', id: body.id, error: { code: -32001, message: 'UCP discovery failed' } })],
+      ['tool error', (query, body) => rpcBody(body, { isError: true, content: [{ type: 'text', text: 'bad request' }] })],
+      ['no products list', (query, body) => jsonResponse(rpcResult(body.id, { products: 'nope' }))],
+      ['a warning message', (query, body) => jsonResponse(rpcResult(body.id, {
+        products: searchRecords(['7111']), messages: [{ type: 'warning', code: 'market_fallback', content: 'x' }],
+      }))],
+      ['unreadable body', () => new Response('<html>oops</html>', { status: 200 })],
+      ['no product IDs', (query, body) => jsonResponse(rpcResult(body.id, {
+        products: [{ id: 'Product/7109', title: 'Omega' }, null, { id: 'gid://shopify/Product/abc' }],
+      }))],
+      ['timeout', (query, body, init) => new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      }), 20],
+    ]) {
+      const { client, catalog, calls } = matchClient({ search, timeoutMs });
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'probiotic' });
+      assert.ok(!result.isError, label);
+      assert.match(result.content[0].text, /No product matching "probiotic" can be added here; hand off to a support agent/, label);
+      assert.deepEqual(await client.findAddableProducts('probiotic', EMAIL), { match: 'none', products: [] }, label);
+      assert.ok(catalog.searches.length >= 1, label);
+      assert.deepEqual(variantIds(await client.findAddableProducts('prenatal', EMAIL)), [8106, 8107], label);
+      assert.equal(writes(calls).length, 0, label);
+    }
+  });
+
+  test('the tool says when a result is interpreted, and no description, handle or search price reaches it', async () => {
+    const { client } = matchClient({ answers: { probiotic: ['7111'] } });
+    const interpreted = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'probiotic' });
+    assert.ok(!interpreted.isError);
+    assert.match(interpreted.content[0].text, /Confirm it with the customer by its product name only/);
+    assert.match(interpreted.content[0].text, /"match": "interpreted"/);
+    const named = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'omega 3' });
+    assert.match(named.content[0].text, /"match": "name"/);
+    assert.doesNotMatch(named.content[0].text, /Confirm it/);
+    for (const result of [interpreted, named]) {
+      assert.ok(!result.content[0].text.includes(DESCRIPTION_MARKER));
+      assert.doesNotMatch(result.content[0].text, /description|html|handle|sku|EUR|Search Only|97111/i);
+    }
+  });
+
+  test('a failed search is logged under DEBUG without the email, the query or descriptions', async () => {
+    const previousDebug = process.env.DEBUG;
+    const originalError = console.error;
+    const captured = [];
+    process.env.DEBUG = 'true';
+    console.error = (...args) => captured.push(args.map(arg => (typeof arg === 'string' ? arg : JSON.stringify(arg))).join(' '));
+    try {
+      const { client } = matchClient({ search: () => new Response('nope', { status: 503 }) });
+      await client.findAddableProducts('probiotic', EMAIL);
+    } finally {
+      console.error = originalError;
+      if (previousDebug === undefined) {
+        delete process.env.DEBUG;
+      } else {
+        process.env.DEBUG = previousDebug;
+      }
+    }
+    assert.ok(captured.some(line => /find_addable_product search failed with status 503 \(http_error\); no match/.test(line)));
+    for (const line of captured) {
+      assert.ok(!line.includes(EMAIL), line);
+      assert.ok(!line.includes('probiotic'), line);
+      assert.ok(!line.includes(DESCRIPTION_MARKER), line);
+    }
+  });
+
+  test('the matcher runs on a plain variant list and search function, with no Recharge', async () => {
+    const variants = [
+      { variantId: '1', productId: '10', productTitle: 'Synbiotic+', variantTitle: 'Default Title', unitPrice: 61.36, currency: 'USD' },
+      { variantId: '2', productId: '20', productTitle: 'Sleep', variantTitle: 'Default Title', unitPrice: 28.41, currency: 'USD' },
+    ];
+    const searched = [];
+    const search = async (query, limit) => { searched.push([query, limit]); return [{ productId: '99', title: 'Other' }, { productId: '10', title: 'Synbiotic' }]; };
+    assert.deepEqual(await matchAddableVariants('sleep', variants, { search }), { match: 'name', variants: [variants[1]] });
+    assert.deepEqual(searched, []);
+    assert.deepEqual(await matchAddableVariants('probiotic', variants, { search }), { match: 'interpreted', variants: [variants[0]] });
+    assert.deepEqual(searched, [['probiotic', INTERPRETED_SEARCH_DEPTH]]);
+
+    const errors = [];
+    const onSearchError = error => errors.push(error.code);
+    assert.deepEqual(await matchAddableVariants('probiotic', variants, { search: async () => { throw Object.assign(new Error('x'), { code: 'timeout' }); }, onSearchError }), { match: 'none', variants: [] });
+    assert.deepEqual(await matchAddableVariants('probiotic', variants, { search: async () => ({ products: [] }), onSearchError }), { match: 'none', variants: [] });
+    assert.deepEqual(errors, ['timeout', 'unparseable']);
+    assert.deepEqual(await matchAddableVariants('probiotic', variants), { match: 'none', variants: [] });
+  });
+});
+
+describe('Shopify catalog search (search_catalog)', () => {
+  test('sends the query, country and limit, and keeps only ranked product IDs and titles', async () => {
+    const catalog = makeCatalog({ search: () => searchRecords(['7109', '7201', '7109']) });
+    const results = await catalog.searchProducts(' fish\n\t oil ', 'US', 5);
+    assert.deepEqual(results, [{ productId: '7109', title: 'Omega-3 DHA & EPA' }, { productId: '7201', title: 'Prenatal Essential Support Ritual*' }]);
+    const [{ body, init }] = catalog.searches;
+    assert.equal(body.method, 'tools/call');
+    assert.equal(body.params.name, 'search_catalog');
+    assert.deepEqual(body.params.arguments.catalog, { query: 'fish oil', context: { address_country: 'US' }, pagination: { limit: 5 } });
+    assert.equal(init.redirect, 'error');
+    assert.equal(catalog.requests.length, 0);
+  });
+
+  test('a result without a product ID or title fails the search wherever it ranks; past the limit it is never read', async () => {
+    for (const entry of [
+      { id: '999', title: 'Protein Powder Sampler' },
+      { id: 'gid://shopify/ProductBundle/999', title: 'Protein Powder Sampler' },
+      { id: 'gid://shopify/Product/999' },
+      { id: 'gid://shopify/Product/999', title: '  ' },
+      null,
+    ]) {
+      for (const products of [[entry, ...searchRecords(['7106'])], [...searchRecords(['7106']), entry]]) {
+        const catalog = makeCatalog({ search: () => products });
+        await assert.rejects(catalog.searchProducts('protein powder', 'US', 5), error => error.code === 'unparseable', JSON.stringify(entry));
+      }
+    }
+    const catalog = makeCatalog({ search: () => [...searchRecords(['7106']), null] });
+    assert.deepEqual(await catalog.searchProducts('protein powder', 'US', 1), [{ productId: '7106', title: 'Daily Shake' }]);
+  });
+
+  test('results past the limit are ignored and the query is capped', async () => {
+    const catalog = makeCatalog({ search: () => searchRecords(['7101', '7102', '7103', '7104', '7105']) });
+    assert.deepEqual((await catalog.searchProducts('multi', 'US', 3)).map(result => result.productId), ['7101', '7102', '7103']);
+    await catalog.searchProducts('x'.repeat(150), 'US', 3);
+    assert.equal(catalog.searches[1].body.params.arguments.catalog.query.length, CATALOG_SEARCH_MAX_QUERY);
+  });
+
+  test('country, limit and query are checked before any request', async () => {
+    const catalog = makeCatalog();
+    for (const country of ['us', 'USA', '', undefined]) {
+      await assert.rejects(catalog.searchProducts('sleep', country, 5), error => error.code === 'invalid_country');
+    }
+    for (const limit of [0, 11, 2.5, '5', undefined]) {
+      await assert.rejects(catalog.searchProducts('sleep', 'US', limit), error => error.code === 'invalid_limit');
+    }
+    for (const query of ['', '   ', '\u0000\u0007', null]) {
+      await assert.rejects(catalog.searchProducts(query, 'US', 5), error => error.code === 'invalid_query');
+    }
+    assert.equal(catalog.searches.length, 0);
+  });
+
+  test('a failed search says "search", not "lookup", and keeps the transport error codes', async () => {
+    const catalog = makeCatalog({ search: () => new Response('nope', { status: 500 }) });
+    await assert.rejects(catalog.searchProducts('sleep', 'US', 5), error => {
+      assert.equal(error.name, 'ShopifyCatalogError');
+      assert.equal(error.code, 'http_error');
+      assert.match(error.message, /^Catalog search failed with HTTP 500$/);
+      return true;
+    });
   });
 });
 
@@ -1599,7 +3060,7 @@ describe('find_addable_product shared file cache', () => {
     const dir = tempCacheDir(t);
     const first = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
     const expected = {};
-    for (const query of ['essential', 'natalbiotic', 'protein']) {
+    for (const query of ['essential for women 18+', 'natalbiotic', 'protein']) {
       expected[query] = (await first.client.findAddableProducts(query, EMAIL)).products;
     }
     assert.equal(first.catalog.requests.length, 1);
@@ -1608,7 +3069,7 @@ describe('find_addable_product shared file cache', () => {
 
     // A new client, catalog and cache object over the same dir: a new child process
     const second = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-    for (const query of ['essential', 'natalbiotic', 'protein']) {
+    for (const query of ['essential for women 18+', 'natalbiotic', 'protein']) {
       assert.deepEqual((await second.client.findAddableProducts(query, EMAIL)).products, expected[query], query);
     }
     assert.equal(second.catalog.requests.length, 0);
@@ -1618,7 +3079,7 @@ describe('find_addable_product shared file cache', () => {
     const dir = tempCacheDir(t);
     const clock = { now: T0 };
     const now = () => clock.now;
-    await makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) }).client.findAddableProducts('essential', EMAIL);
+    await makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) }).client.findAddableProducts('essential for women 18+', EMAIL);
     const file = path.join(dir, cacheFiles(dir)[0]);
     assert.equal(JSON.parse(readFileSync(file, 'utf8')).storedAt, T0);
 
@@ -1626,13 +3087,13 @@ describe('find_addable_product shared file cache', () => {
     for (const offset of [60 * 60 * 1000 - 1000, 60 * 60 * 1000 - 1]) {
       clock.now = T0 + offset;
       const reader = makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) });
-      assert.equal((await reader.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+      assert.equal((await reader.client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
       assert.equal(reader.catalog.requests.length, 0, `hit at +${offset}ms`);
     }
 
     clock.now = T0 + 60 * 60 * 1000;
     const expired = makeClient({ catalogCache: createAddableCatalogCache({ dir, now }) });
-    assert.equal((await expired.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal((await expired.client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
     assert.equal(expired.catalog.requests.length, 1);
     // The fresh lookup replaced the entry
     assert.equal(JSON.parse(readFileSync(file, 'utf8')).storedAt, T0 + 60 * 60 * 1000);
@@ -1641,12 +3102,12 @@ describe('find_addable_product shared file cache', () => {
   test('the in-memory layer expires with the same TTL', async t => {
     const clock = { now: T0 };
     const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir: tempCacheDir(t), now: () => clock.now }) });
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     clock.now = T0 + ADDABLE_CATALOG_CACHE_TTL_MS - 1000;
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     assert.equal(catalog.requests.length, 1);
     clock.now = T0 + ADDABLE_CATALOG_CACHE_TTL_MS;
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     assert.equal(catalog.requests.length, 2);
   });
 
@@ -1665,7 +3126,7 @@ describe('find_addable_product shared file cache', () => {
     ];
     for (const [index, [label, options]] of cases.entries()) {
       const { client, catalog } = makeClient({ ...options, catalogCache: cache() });
-      await client.findAddableProducts('essential', EMAIL);
+      await client.findAddableProducts('essential for women 18+', EMAIL);
       assert.equal(catalog.requests.length, 1, label);
       assert.equal(cacheFiles(dir).length, index + 1, label);
     }
@@ -1674,12 +3135,12 @@ describe('find_addable_product shared file cache', () => {
     for (const [label, options] of cases) {
       const fresh = { ...options, ...(options.catalog ? { catalog: sameCatalog(options.catalog) } : {}) };
       const { client, catalog } = makeClient({ ...fresh, catalogCache: cache() });
-      await client.findAddableProducts('essential', EMAIL);
+      await client.findAddableProducts('essential for women 18+', EMAIL);
       assert.equal(catalog.requests.length, 0, label);
     }
     // The key uses the sorted allowlist: the same pairs in another order are the same entry
     const reordered = makeClient({ addable: new Map([...ADDABLE].reverse()), catalogCache: cache() });
-    await reordered.client.findAddableProducts('essential', EMAIL);
+    await reordered.client.findAddableProducts('essential for women 18+', EMAIL);
     assert.equal(reordered.catalog.requests.length, 0);
     assert.equal(cacheFiles(dir).length, cases.length);
   });
@@ -1687,7 +3148,7 @@ describe('find_addable_product shared file cache', () => {
   test('a corrupt, wrong-version, future, mis-scoped (country or currency) or mistyped entry is a miss and is overwritten', async t => {
     const dir = tempCacheDir(t);
     const seeded = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-    const expected = (await seeded.client.findAddableProducts('essential', EMAIL)).products;
+    const expected = (await seeded.client.findAddableProducts('essential for women 18+', EMAIL)).products;
     const file = path.join(dir, cacheFiles(dir)[0]);
     const good = JSON.parse(readFileSync(file, 'utf8'));
     const withVariant = (field, value) => ({
@@ -1731,7 +3192,7 @@ describe('find_addable_product shared file cache', () => {
     for (const [label, entry] of Object.entries(cases)) {
       writeFileSync(file, typeof entry === 'string' ? entry : JSON.stringify(entry));
       const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-      assert.deepEqual((await client.findAddableProducts('essential', EMAIL)).products, expected, label);
+      assert.deepEqual((await client.findAddableProducts('essential for women 18+', EMAIL)).products, expected, label);
       assert.equal(catalog.requests.length, 1, label);
       const rewritten = JSON.parse(readFileSync(file, 'utf8'));
       assert.equal(rewritten.version, 2, label);
@@ -1747,13 +3208,13 @@ describe('find_addable_product shared file cache', () => {
       ? new Response('nope', { status: 500 })
       : lookupResponse(catalogFixtures(), body));
     const { client, catalog } = makeClient({ addable: BIG_ADDABLE, catalog: makeCatalog({ respond: failing }), catalogCache: createAddableCatalogCache({ dir }) });
-    await assert.rejects(client.findAddableProducts('essential', EMAIL));
+    await assert.rejects(client.findAddableProducts('essential for women 18+', EMAIL));
     assert.equal(catalog.requests.length, 3);
     assert.deepEqual(cacheFiles(dir), []);
 
     // The next search reads the catalog again (no error or partial result was kept)
     const next = makeClient({ addable: BIG_ADDABLE, catalogCache: createAddableCatalogCache({ dir }) });
-    assert.equal((await next.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal((await next.client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
     assert.equal(next.catalog.requests.length, 3);
     assert.equal(cacheFiles(dir).length, 1);
   });
@@ -1774,7 +3235,7 @@ describe('find_addable_product shared file cache', () => {
       for (const dir of dirs) {
         for (let run = 0; run < 2; run += 1) {
           const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-          const { products } = await client.findAddableProducts('essential', EMAIL);
+          const { products } = await client.findAddableProducts('essential for women 18+', EMAIL);
           assert.deepEqual(products.map(product => product.variant_id), [8001, 8006], dir);
           assert.equal(catalog.requests.length, 1, dir);
         }
@@ -1791,7 +3252,7 @@ describe('find_addable_product shared file cache', () => {
 
   test('create_onetime and create_subscription never read or write the cache', async t => {
     const dir = tempCacheDir(t);
-    await makeClient({ catalogCache: createAddableCatalogCache({ dir }) }).client.findAddableProducts('essential', EMAIL);
+    await makeClient({ catalogCache: createAddableCatalogCache({ dir }) }).client.findAddableProducts('essential for women 18+', EMAIL);
     const file = path.join(dir, cacheFiles(dir)[0]);
     const before = readFileSync(file, 'utf8');
 
@@ -1810,7 +3271,7 @@ describe('find_addable_product shared file cache', () => {
     assert.equal(readFileSync(file, 'utf8'), before);
 
     // The entry was valid all along: a search on the same client uses it
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     assert.equal(catalog.requests.length, 2);
     assert.deepEqual(used, ['get']);
 
@@ -1826,7 +3287,7 @@ describe('find_addable_product shared file cache', () => {
   test('entries hold only the find fields (no descriptions), in a 0700 dir as 0600 files', async t => {
     const dir = path.join(tempCacheDir(t), 'nested');
     const { client } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-    await client.findAddableProducts('essential', EMAIL);
+    await client.findAddableProducts('essential for women 18+', EMAIL);
     const [name] = cacheFiles(dir);
     const text = readFileSync(path.join(dir, name), 'utf8');
     assert.ok(!text.includes(DESCRIPTION_MARKER));
@@ -1851,7 +3312,7 @@ describe('find_addable_product shared file cache', () => {
       chmodSync(dir, mode);
       for (let run = 0; run < 2; run += 1) {
         const { client, catalog } = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-        assert.equal((await client.findAddableProducts('essential', EMAIL)).products.length, 2);
+        assert.equal((await client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
         assert.equal(catalog.requests.length, 1, mode.toString(8));
       }
       assert.equal(statSync(dir).mode & 0o7777, mode);
@@ -1863,14 +3324,14 @@ describe('find_addable_product shared file cache', () => {
     const dir = tempCacheDir(t);
     // Every chunk succeeds but the catalog returns nothing (e.g. a brief unpublish or a catalog blip)
     const empty = makeClient({ catalog: makeCatalog({ db: {} }), catalogCache: createAddableCatalogCache({ dir }) });
-    assert.deepEqual((await empty.client.findAddableProducts('essential', EMAIL)).products, []);
+    assert.deepEqual((await empty.client.findAddableProducts('essential for women 18+', EMAIL)).products, []);
     assert.equal(empty.catalog.requests.length, 1);
     assert.deepEqual(cacheFiles(dir), []);
     // The next search (same process or another) reads the catalog again
-    await empty.client.findAddableProducts('essential', EMAIL);
+    await empty.client.findAddableProducts('essential for women 18+', EMAIL);
     assert.equal(empty.catalog.requests.length, 2);
     const next = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-    assert.equal((await next.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal((await next.client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
     assert.equal(next.catalog.requests.length, 1);
     assert.equal(cacheFiles(dir).length, 1);
   });
@@ -1882,20 +3343,20 @@ describe('find_addable_product shared file cache', () => {
     db.US[0].variants[0].price.amount = '33.00';
     db.US.push({ ...ucpProduct('7001', 'Essential for Women 18+', 'essential-2', [db.US[0].variants.pop()]), id: 'Product/7001' });
     const first = makeClient({ catalog: makeCatalog({ db }), catalogCache: createAddableCatalogCache({ dir }) });
-    assert.deepEqual((await first.client.findAddableProducts('essential', EMAIL)).products, []);
+    assert.deepEqual((await first.client.findAddableProducts('essential for women 18+', EMAIL)).products, []);
     const stored = JSON.parse(readFileSync(path.join(dir, cacheFiles(dir)[0]), 'utf8')).variants;
     assert.equal(stored.find(variant => variant.variantId === '8001').unitPrice, null);
     assert.equal(stored.find(variant => variant.variantId === '8006').productId, null);
 
     const second = makeClient({ catalog: makeCatalog({ db }), catalogCache: createAddableCatalogCache({ dir }) });
-    assert.deepEqual((await second.client.findAddableProducts('essential', EMAIL)).products, []);
+    assert.deepEqual((await second.client.findAddableProducts('essential for women 18+', EMAIL)).products, []);
     assert.deepEqual((await second.client.findAddableProducts('natalbiotic', EMAIL)).products.map(product => product.variant_id), [42144416137310]);
     assert.equal(second.catalog.requests.length, 0);
   });
 
   test('entries are written atomically: a temp file renamed over the entry, never written through', { skip: process.platform === 'win32' }, async t => {
     const dir = tempCacheDir(t);
-    await makeClient({ catalogCache: createAddableCatalogCache({ dir }) }).client.findAddableProducts('essential', EMAIL);
+    await makeClient({ catalogCache: createAddableCatalogCache({ dir }) }).client.findAddableProducts('essential for women 18+', EMAIL);
     const [name] = cacheFiles(dir);
     const file = path.join(dir, name);
     const good = readFileSync(file, 'utf8');
@@ -1906,7 +3367,7 @@ describe('find_addable_product shared file cache', () => {
     rmSync(file);
     symlinkSync(victim, file);
     const relinked = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-    assert.equal((await relinked.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+    assert.equal((await relinked.client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
     assert.equal(relinked.catalog.requests.length, 1);
     assert.equal(readFileSync(victim, 'utf8'), 'original');
     assert.ok(lstatSync(file).isFile());
@@ -1919,7 +3380,7 @@ describe('find_addable_product shared file cache', () => {
     writeFileSync(path.join(file, 'keep'), 'x');
     for (let run = 0; run < 2; run += 1) {
       const blocked = makeClient({ catalogCache: createAddableCatalogCache({ dir }) });
-      assert.equal((await blocked.client.findAddableProducts('essential', EMAIL)).products.length, 2);
+      assert.equal((await blocked.client.findAddableProducts('essential for women 18+', EMAIL)).products.length, 2);
       assert.equal(blocked.catalog.requests.length, 1);
       assert.deepEqual(cacheFiles(dir), [name]);
     }
@@ -1956,7 +3417,7 @@ describe('find_addable_product shared file cache', () => {
       : new Promise(resolve => release.push(() => resolve(lookupResponse(catalogFixtures(), body)))));
     const { client, catalog } = makeClient({ addable: BIG_ADDABLE, catalog: makeCatalog({ respond }), catalogCache: createAddableCatalogCache({ dir }) });
     try {
-      await assert.rejects(client.findAddableProducts('essential', EMAIL));
+      await assert.rejects(client.findAddableProducts('essential for women 18+', EMAIL));
       assert.equal(catalog.requests.length, 3);
       assert.equal(release.length, 2);
       assert.deepEqual(cacheFiles(dir), []);
@@ -2072,7 +3533,7 @@ describe('adds in the subscribed currency', () => {
     await client.verifiedCreateOnetime(onetimeArgs(), EMAIL);
     await client.verifiedCreateSubscription(subscriptionArgs(), EMAIL);
     assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes', 'POST /subscriptions']);
-    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
     assert.deepEqual([first.unit_price, first.currency], ['33.00', 'USD']);
     assert.deepEqual(findCatalogContext(catalog), ['US', 'US', 'US']);
   });
@@ -2133,13 +3594,13 @@ describe('adds in the subscribed currency', () => {
     });
     await client.verifiedCreateOnetime(natalbioticArgs(onetimeArgs), EMAIL);
     assert.deepEqual(writes(calls).map(call => `${call.method} ${call.endpoint}`), ['POST /onetimes']);
-    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
     assert.deepEqual([first.unit_price, first.currency], ['45.00', 'CAD']);
     assert.deepEqual(findCatalogContext(catalog), ['CA', 'CA']);
 
     const us = makeClient({ db: withBase(setCurrency(fixtures(), 'CAD', [1001, 1004, 1005])) });
     await currencyRefusal(us.calls, us.client.verifiedCreateOnetime(onetimeArgs(), EMAIL), /can't be priced in CAD/);
-    const result = await toolByName('find_addable_product').execute(us.client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(us.client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /can't be priced in CAD.*No change was made/);
     assert.equal(us.catalog.requests.length, 0);
@@ -2192,7 +3653,7 @@ describe('find_addable_product in the subscribed currency', () => {
   test('prices are quoted in the currency of the active subscriptions', async () => {
     for (const [db, country, currency, price] of [[withCountry('CA'), 'CA', 'CAD', '45.00'], [fixtures(), 'US', 'USD', '33.00']]) {
       const { client, calls, catalog } = makeClient({ db });
-      const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+      const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
       assert.deepEqual([first.unit_price, first.currency], [price, currency]);
       assert.deepEqual(findCatalogContext(catalog), [country]);
       assert.deepEqual(calls.find(call => call.endpoint === '/subscriptions').params, { customer_id: '100', status: 'active', limit: 250 });
@@ -2202,7 +3663,7 @@ describe('find_addable_product in the subscribed currency', () => {
   test('an address with no subscriptions does not pick the country', async () => {
     // 501 is CA with CAD subscriptions; 502 is US and holds none of alice's
     const { client, catalog } = makeClient({ db: withCountry('CA', [501]) });
-    const [first] = (await client.findAddableProducts('30 count', EMAIL)).products;
+    const [first] = (await client.findAddableProducts('essential for women 18+ 30 count', EMAIL)).products;
     assert.deepEqual(findCatalogContext(catalog), ['CA']);
     assert.deepEqual([first.unit_price, first.currency], ['45.00', 'CAD']);
   });
@@ -2211,7 +3672,7 @@ describe('find_addable_product in the subscribed currency', () => {
     const db = fixtures();
     db.subscriptions.push({ ...structuredClone(db.subscriptions[0]), id: 1006, address_id: 502, presentment_currency: 'CAD' });
     const { client, catalog, calls } = makeClient({ db });
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /not all billed in one currency.*No change was made.*hand off to a support agent/);
     assert.equal(catalog.requests.length, 0);
@@ -2224,7 +3685,7 @@ describe('find_addable_product in the subscribed currency', () => {
       subscription.status = 'cancelled';
     }
     const { client, catalog } = makeClient({ db });
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /no active subscription.*No change was made.*hand off to a support agent/);
     assert.equal(catalog.requests.length, 0);
@@ -2233,7 +3694,7 @@ describe('find_addable_product in the subscribed currency', () => {
   test("a subscribed currency the country's market is not priced in is refused and nothing is cached", async t => {
     const dir = tempCacheDir(t);
     const { client, catalog } = makeClient({ db: setCurrency(fixtures(), 'CAD', [1001, 1004, 1005]), catalogCache: createAddableCatalogCache({ dir }) });
-    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+    const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /can't be priced in CAD.*No change was made.*hand off to a support agent/);
     assert.equal(catalog.requests.length, 0);
@@ -2247,7 +3708,7 @@ describe('find_addable_product in the subscribed currency', () => {
       catalog: makeCatalog({ db: mxCatalog(id => (id === variantGid('8006') ? 'USD' : 'MXN')) }),
       catalogCache: createAddableCatalogCache({ dir }),
     });
-    const { products } = await client.findAddableProducts('essential', EMAIL);
+    const { products } = await client.findAddableProducts('essential for women 18+', EMAIL);
     assert.deepEqual(products.map(product => [product.variant_id, product.currency]), [[8001, 'MXN']]);
     assert.deepEqual(findCatalogContext(catalog), ['MX']);
     assert.deepEqual(cacheFiles(dir), []);
@@ -2258,7 +3719,7 @@ describe('find_addable_product in the subscribed currency', () => {
     const fullPage = Array.from({ length: 250 }, (_, index) => ({ ...structuredClone(fixtures().subscriptions[0]), id: 10000 + index }));
     for (const page of [{ subscriptions: [], next_cursor: 'next' }, { subscriptions: fullPage }]) {
       const { client, catalog } = makeClient({ overrides: { 'GET /subscriptions': () => structuredClone(page) } });
-      const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential' });
+      const result = await toolByName('find_addable_product').execute(client, { customer_email: EMAIL, query: 'essential for women 18+' });
       assert.equal(result.isError, true);
       assert.match(result.content[0].text, /too many subscriptions on this account to check.*No change was made.*hand off to a support agent/);
       assert.equal(catalog.requests.length, 0);
@@ -2269,7 +3730,7 @@ describe('find_addable_product in the subscribed currency', () => {
     const dir = tempCacheDir(t);
     const cache = createAddableCatalogCache({ dir });
     const scope = { endpoint: UCP_URL, profileUrl: PROFILE_URL, country: 'US', addable: new Map([['8001', '7001']]) };
-    const variant = currency => new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: '30 count', unitPrice: 33, currency, available: true }]]);
+    const variant = currency => new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: 'essential for women 18+ 30 count', unitPrice: 33, currency, available: true }]]);
     await cache.set({ ...scope, currency: 'USD' }, variant('USD'));
     assert.equal(await createAddableCatalogCache({ dir }).get({ ...scope, currency: 'CAD' }), null);
     assert.equal((await createAddableCatalogCache({ dir }).get({ ...scope, currency: 'USD' })).get('8001').currency, 'USD');
@@ -2454,7 +3915,7 @@ describe('server (stdio)', () => {
       MCP_HOSTED_MODE: 'true', MCP_VERIFIED_ADDABLE_VARIANTS: '7001:8001',
       MCP_SHOPIFY_UCP_URL: 'https://127.0.0.1:9/api/ucp/mcp', MCP_UCP_AGENT_PROFILE: PROFILE_URL,
     }, async ({ request, stderr }) => {
-      const result = await callTool(request, 'find_addable_product', { customer_email: EMAIL, query: 'essential' });
+      const result = await callTool(request, 'find_addable_product', { customer_email: EMAIL, query: 'essential for women 18+' });
       assert.equal(result.isError, true);
       assert.match(result.content[0].text, /Products could not be looked up right now, so nothing can be added; hand off to a support agent/);
       assert.doesNotMatch(result.content[0].text, /Adding products isn't available here/);
@@ -2469,14 +3930,14 @@ describe('server (stdio)', () => {
     const seed = createShopifyCatalog({ endpoint, profileUrl: PROFILE_URL, fetchImpl: async () => { throw new Error('no network'); } });
     await createAddableCatalogCache({ dir }).set(
       { endpoint: seed.endpoint, profileUrl: seed.profileUrl, country: 'US', currency: 'USD', addable: new Map([['8001', '7001']]) },
-      new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: '30 count', unitPrice: 33, currency: 'USD', available: true }]]),
+      new Map([['8001', { productId: '7001', productTitle: 'Essential for Women 18+', variantTitle: 'essential for women 18+ 30 count', unitPrice: 33, currency: 'USD', available: true }]]),
     );
     assert.equal(cacheFiles(dir).length, 1);
     const env = { MCP_VERIFIED_ADDABLE_VARIANTS: '7001:8001', MCP_SHOPIFY_UCP_URL: endpoint, MCP_UCP_AGENT_PROFILE: PROFILE_URL };
     // Two separate processes (as behind a stateless gateway): both answer from the entry, no email so no Recharge read
     for (const debugEnv of [{ DEBUG: 'true' }, {}]) {
       await withServer({ ...env, ...debugEnv, MCP_CATALOG_CACHE_DIR: dir }, async ({ request, stderr }) => {
-        const result = await callTool(request, 'find_addable_product', { query: 'essential' });
+        const result = await callTool(request, 'find_addable_product', { query: 'essential for women 18+' });
         assert.ok(!result.isError, result.content[0].text);
         assert.match(result.content[0].text, /Addable Products/);
         assert.match(result.content[0].text, /"variant_id": 8001/);
@@ -2488,7 +3949,7 @@ describe('server (stdio)', () => {
     }
     // Another (empty) MCP_CATALOG_CACHE_DIR: the unreachable catalog is read, so a hand-off
     await withServer({ ...env, MCP_CATALOG_CACHE_DIR: tempCacheDir(t) }, async ({ request }) => {
-      const result = await callTool(request, 'find_addable_product', { query: 'essential' });
+      const result = await callTool(request, 'find_addable_product', { query: 'essential for women 18+' });
       assert.match(result.content[0].text, /Products could not be looked up right now/);
     });
   });
@@ -2500,7 +3961,7 @@ describe('server (stdio)', () => {
     ];
     for (const [env, pattern] of cases) {
       await withServer({ MCP_HOSTED_MODE: 'true', MCP_VERIFIED_ADDABLE_VARIANTS: '7001:8001', ...env }, async ({ request, stderr }) => {
-        const result = await callTool(request, 'find_addable_product', { customer_email: EMAIL, query: 'essential' });
+        const result = await callTool(request, 'find_addable_product', { customer_email: EMAIL, query: 'essential for women 18+' });
         assert.match(result.content[0].text, /Adding products isn't available here; hand off to a support agent/);
         assert.match(stderr(), pattern);
       });

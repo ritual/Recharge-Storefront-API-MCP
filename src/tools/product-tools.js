@@ -78,10 +78,16 @@ export const productTools = [
     name: 'find_addable_product',
     description:
       'Look up only the product the customer named, among the products that can be added to their orders here. ' +
-      'Do not list or present products as options. No match means it can\'t be added here; hand off to a support agent. ' +
+      'The query is the product name exactly as the customer said it (an old name, abbreviation, flavor or misspelling is fine), ' +
+      'never a symptom, need or goal. ' +
+      'The result\'s match is "name" when the customer\'s words match a product\'s title, ' +
+      '"interpreted" when they did not and the store matched the customer\'s words to a product: ' +
+      'confirm an interpreted product with the customer by its product name only, before quoting a price or making any change. ' +
+      'Never list or offer products the customer didn\'t name, and do not present results as options. ' +
+      'match "none" means it can\'t be added here; hand off to a support agent. ' +
       'Never describe what a product does or make any health, ingredient or benefit claim.',
     inputSchema: baseSchema.extend({
-      query: z.string().min(1).max(100).describe('The product name the customer used'),
+      query: z.string().min(1).max(100).describe('The product name the customer used, as they said it'),
     }),
     execute: async (client, args) => {
       // No allowlist or no Shopify catalog configured: nothing can be added
@@ -121,9 +127,18 @@ export const productTools = [
           isError: true,
         };
       }
-      const text = result.products.length === 0
-        ? `No product matching "${args.query}" can be added here; hand off to a support agent.`
-        : `Addable Products:\n${JSON.stringify(result, null, 2)}`;
+      let text;
+      if (result.products.length === 0) {
+        text = `No product matching "${args.query}" can be added here; hand off to a support agent.`;
+      } else if (result.match === 'interpreted') {
+        text = 'No product title matches these words; this is the product the store matched to the customer\'s words ' +
+          '(listed once per flavor or size). Confirm it with the customer by its product name only, without describing it ' +
+          'or giving any reason or benefit, before quoting a price or making any change. ' +
+          'Do not offer any other product or search result as a suggestion.\n' +
+          `Addable Products:\n${JSON.stringify(result, null, 2)}`;
+      } else {
+        text = `Addable Products:\n${JSON.stringify(result, null, 2)}`;
+      }
 
       return {
         content: [
