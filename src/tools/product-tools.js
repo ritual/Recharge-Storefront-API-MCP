@@ -97,7 +97,8 @@ export const productTools = [
       }
 
       // Public Shopify storefront catalog read, plus admin reads (caller tokens are stripped in
-      // hosted mode, so the server's admin token) of the customer's addresses for the country and plans
+      // hosted mode, so the server's admin token) of the customer's addresses and active subscriptions
+      // for the country, currency and plans
       let result;
       try {
         result = await client.findAddableProducts(args.query, args.customer_email);

@@ -4,8 +4,8 @@
  * Behind supergateway's stateless streamableHttp mode every HTTP request is a
  * new child process, so an in-memory cache never hits. Child processes in one
  * container share its filesystem, so the catalog read for find_addable_product
- * is cached as one JSON file per (catalog endpoint, country, allowlist) in a
- * private directory, for ADDABLE_CATALOG_CACHE_TTL_MS.
+ * is cached as one JSON file per (catalog endpoint, country, currency,
+ * allowlist) in a private directory, for ADDABLE_CATALOG_CACHE_TTL_MS.
  *
  * Only the fields the find tool uses are stored (never descriptions). The
  * cache never throws: anything unreadable, invalid or expired is a miss, and
@@ -19,7 +19,7 @@ import path from 'node:path';
 import { currencyFractionDigits } from './shopify-catalog.js';
 
 export const ADDABLE_CATALOG_CACHE_TTL_MS = 60 * 60 * 1000;
-export const CATALOG_CACHE_VERSION = 1;
+export const CATALOG_CACHE_VERSION = 2;
 
 const DIGITS = /^\d+$/;
 // Only a short plain fs error code (EACCES, ENOENT) is ever logged
@@ -51,13 +51,13 @@ function cacheError(code) {
 }
 
 /**
- * Cache key: the endpoint, agent profile, country and sorted allowlist pairs,
- * so a change to any of them never serves an old entry.
+ * Cache key: the endpoint, agent profile, country, currency and sorted
+ * allowlist pairs, so a change to any of them never serves an old entry.
  */
-function cacheKey({ endpoint, profileUrl, country, addable }) {
+function cacheKey({ endpoint, profileUrl, country, currency, addable }) {
   const pairs = [...addable].map(([variantId, productId]) => `${variantId}:${productId}`).sort();
   return createHash('sha256')
-    .update(JSON.stringify([CATALOG_CACHE_VERSION, endpoint, profileUrl, country, pairs]))
+    .update(JSON.stringify([CATALOG_CACHE_VERSION, endpoint, profileUrl, country, currency, pairs]))
     .digest('hex');
 }
 
@@ -95,12 +95,13 @@ function toStored(variants) {
 
 /**
  * A stored entry back as a catalog Map, or null if anything about it is off:
- * every field's type, allowlisted unique variant IDs, the country, and an
- * age from 0 up to (not including) the TTL.
+ * every field's type, allowlisted unique variant IDs, the country, the
+ * currency (of the entry and every variant), and an age from 0 up to (not
+ * including) the TTL.
  */
-function fromStored(entry, { country, addable, now, ttlMs }) {
+function fromStored(entry, { country, currency, addable, now, ttlMs }) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
-      entry.version !== CATALOG_CACHE_VERSION || entry.country !== country ||
+      entry.version !== CATALOG_CACHE_VERSION || entry.country !== country || entry.currency !== currency ||
       !Number.isSafeInteger(entry.storedAt) || entry.storedAt > now || now - entry.storedAt >= ttlMs ||
       !Array.isArray(entry.variants)) {
     return null;
@@ -111,7 +112,7 @@ function fromStored(entry, { country, addable, now, ttlMs }) {
         typeof item.variantId !== 'string' || !addable.has(item.variantId) || variants.has(item.variantId) ||
         !(item.productId === null || (typeof item.productId === 'string' && DIGITS.test(item.productId))) ||
         typeof item.productTitle !== 'string' || typeof item.variantTitle !== 'string' ||
-        typeof item.currency !== 'string' || !validPrice(item.unitPrice, item.currency) ||
+        typeof item.currency !== 'string' || item.currency !== currency || !validPrice(item.unitPrice, item.currency) ||
         typeof item.available !== 'boolean') {
       return null;
     }
@@ -152,7 +153,7 @@ export function createAddableCatalogCache({ dir = defaultCatalogCacheDir(), now 
   async function get(scope) {
     try {
       const key = cacheKey(scope);
-      const options = { country: scope.country, addable: scope.addable, now: now(), ttlMs };
+      const options = { country: scope.country, currency: scope.currency, addable: scope.addable, now: now(), ttlMs };
       const remembered = memory.get(key);
       if (remembered) {
         const variants = fromStored(remembered, options);
@@ -196,7 +197,13 @@ export function createAddableCatalogCache({ dir = defaultCatalogCacheDir(), now 
     let tempPath = null;
     try {
       const key = cacheKey(scope);
-      const entry = { version: CATALOG_CACHE_VERSION, storedAt: now(), country: scope.country, variants: toStored(variants) };
+      const entry = {
+        version: CATALOG_CACHE_VERSION,
+        storedAt: now(),
+        country: scope.country,
+        currency: scope.currency,
+        variants: toStored(variants),
+      };
       memory.set(key, entry);
       // Only a directory created here is set to 0700 (whatever the umask)
       const created = await mkdir(cacheDir, { recursive: true, mode: 0o700 });
