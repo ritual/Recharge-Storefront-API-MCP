@@ -3,6 +3,7 @@ import { handleAPIError } from './utils/error-handler.js';
 import { SessionCache } from './utils/session-cache.js';
 import { DEFAULT_VERIFIED_MAX_QUANTITY } from './utils/verified-writes.js';
 import { currencyFractionDigits } from './utils/shopify-catalog.js';
+import { matchAddableVariants } from './utils/product-matching.js';
 
 /**
  * Resource IDs are interpolated into endpoint paths, so reject anything that
@@ -92,13 +93,6 @@ function sharedSubscriptionCurrency(subscriptions) {
   const currencies = new Set(subscriptions.map(subscriptionCurrency));
   const [only] = currencies;
   return currencies.size === 1 && only ? only : '';
-}
-
-/**
- * Lowercased whole words of a product title or query, for word matching.
- */
-function titleWords(text) {
-  return String(text || '').toLowerCase().split(/[^a-z0-9+]+/).filter(Boolean);
 }
 
 export function verifiedWriteRefusal(message) {
@@ -2155,23 +2149,32 @@ export class RechargeClient {
   }
 
   /**
-   * Read-only lookup of allowlisted, available, priced variants whose
-   * product or variant title matches the query, priced in the customer's
-   * country and subscribed currency. Every query word must be a whole word of the title or the start
-   * of one ("men" never matches "women"). A variant the catalog doesn't
-   * return for its allowlisted product is skipped, not fatal. Descriptions
-   * are never read into the result.
+   * Read-only lookup of allowlisted, available, priced variants for the
+   * product the customer named, priced in the customer's country and
+   * subscribed currency (src/utils/product-matching.js). First by name: every
+   * query word must match a word of the title, allowing normalized spellings
+   * and small typos but never a different number ("men" never matches
+   * "women", "18+" never "50+"); match is "name". Only when nothing matches by
+   * name, and only for words that each name something sold here, Shopify's
+   * storefront search interprets the query and picks up to 3 allowlisted
+   * products; match is "interpreted". Price, currency, availability
+   * and variants always come from the catalog lookup, never the search, and a
+   * search failure is no match. A variant the catalog doesn't return for its
+   * allowlisted product is skipped, not fatal. Descriptions are never read
+   * into the result.
    */
   async findAddableProducts(query, customerEmail) {
-    const words = titleWords(query);
-    if (this.addableVariants.size === 0 || !this.catalog || words.length === 0) {
-      return { products: [] };
+    if (this.addableVariants.size === 0 || !this.catalog || String(query ?? '').trim() === '') {
+      return { match: 'none', products: [] };
     }
 
     const { country, currency } = await this.getAddableLookupContext(customerEmail);
     const catalog = await this.getCachedAddableCatalog(country, currency);
 
-    const products = [];
+    const sellable = [];
+    // Allowlisted variants the catalog returned under their product that can't be sold now: matched by name
+    // too, so a product the customer named that is out of stock is never swapped for a sibling
+    const unsellable = [];
     for (const [variantId, productId] of this.addableVariants) {
       const variant = catalog.get(variantId);
       if (!variant || variant.productId !== productId || variant.available !== true || !(variant.unitPrice > 0) ||
@@ -2179,23 +2182,52 @@ export class RechargeClient {
         if (process.env.DEBUG === 'true') {
           console.error(`[DEBUG] find_addable_product skipped variant ${variantId}: not sellable in product ${productId} for ${country} in ${currency}`);
         }
+        if (variant && variant.productId === productId) {
+          unsellable.push({ ...variant, variantId, productId });
+        }
         continue;
       }
-      const titleTokens = titleWords(`${variant.productTitle} ${variant.variantTitle}`);
-      if (!words.every(word => titleTokens.some(token => token === word || token.startsWith(word)))) {
-        continue;
+      sellable.push({ ...variant, variantId, productId });
+    }
+    if (process.env.DEBUG === 'true') {
+      // While one of these has no variant read, its title is unknown: partial names match nothing and nothing is searched
+      const read = new Set([...sellable, ...unsellable].map(variant => variant.productId));
+      const unknown = [...new Set(this.addableVariants.values())].filter(productId => !read.has(productId));
+      if (unknown.length > 0) {
+        console.error(`[DEBUG] find_addable_product: catalog returned no variant of allowlisted products ${unknown.join(', ')}; interpreted matches are off`);
       }
+    }
+
+    // The storefront search only runs when no title matches; it is never cached
+    const search = typeof this.catalog.searchProducts === 'function'
+      ? (text, limit) => this.catalog.searchProducts(text, country, limit)
+      : null;
+    const { match, variants } = await matchAddableVariants(query, sellable, {
+      search,
+      // An allowlisted product the search ranks first that isn't sellable now is never swapped for another
+      allowlisted: new Set(this.addableVariants.values()),
+      unsellable,
+      onSearchError: error => {
+        if (process.env.DEBUG === 'true') {
+          const code = error && error.code ? ` (${error.code})` : '';
+          console.error(`[DEBUG] find_addable_product search failed with status ${(error && error.statusCode) ?? 'unknown'}${code}; no match`);
+        }
+      },
+    });
+
+    const products = [];
+    for (const variant of variants) {
       let canSubscribe = false;
       try {
-        canSubscribe = (await this.getVerifiedSubscriptionPlans(productId, variantId)).length > 0;
+        canSubscribe = (await this.getVerifiedSubscriptionPlans(variant.productId, variant.variantId)).length > 0;
       } catch (error) {
         if (process.env.DEBUG === 'true') {
-          console.error(`[DEBUG] Plan lookup failed for product ${productId}:`, error.message);
+          console.error(`[DEBUG] Plan lookup failed for product ${variant.productId}:`, error.message);
         }
       }
       products.push({
         // A number, as create_onetime and create_subscription take it (allowlisted IDs are safe integers)
-        variant_id: Number(variantId),
+        variant_id: Number(variant.variantId),
         title: variant.productTitle,
         variant_title: variant.variantTitle,
         unit_price: variant.unitPrice.toFixed(currencyFractionDigits(variant.currency)),
@@ -2203,6 +2235,6 @@ export class RechargeClient {
         can_subscribe: canSubscribe,
       });
     }
-    return { products };
+    return { match: products.length > 0 ? match : 'none', products };
   }
 }
