@@ -4002,18 +4002,19 @@ describe('server (stdio): customer not found', () => {
         assert.equal(body.customer_found, false, name);
         // Client procedures branch on this literal phrase; the email is echoed as given
         assert.ok(body.message.startsWith(`Customer not found with email: ${UNKNOWN_EMAIL}. No Recharge customer uses this conversation's verified email`), name);
-        assert.match(body.message, /Looking up again returns the same result.*Don't ask for account IDs or tokens\.$/, name);
+        assert.match(body.message, /no account data to show\. Looking up again returns the same result.*Don't ask for account IDs or tokens\.$/, name);
         assert.doesNotMatch(body.message, /hand off/, name);
       }
     });
   });
 
-  test('hosted writes for an unknown customer still refuse with an error', async t => {
+  test('hosted writes and caller-email lookups for an unknown customer still refuse with an error', async t => {
     await withServer({ MCP_HOSTED_MODE: 'true', ...stubCustomerLookup(t, []) }, async ({ request }) => {
-      for (const [name, args] of [['skip_subscription', { subscription_id: '1001', date: FUTURE_1 }], ['cancel_subscription', { subscription_id: '1001' }]]) {
+      for (const [name, args] of [['skip_subscription', { subscription_id: '1001', date: FUTURE_1 }], ['cancel_subscription', { subscription_id: '1001' }], ['get_customer_by_email', { email: UNKNOWN_EMAIL }]]) {
         const result = await callTool(request, name, { customer_email: UNKNOWN_EMAIL, ...args });
         assert.equal(result.isError, true, name);
-        assert.match(result.content[0].text, /Customer not found with email.*hand off to a support agent/, name);
+        assert.match(result.content[0].text, /hand off to a support agent/, name);
+        if (name !== 'get_customer_by_email') assert.match(result.content[0].text, /Customer not found with email/, name);
         assert.doesNotMatch(result.content[0].text, /customer_found/, name);
       }
     });
@@ -4026,6 +4027,18 @@ describe('server (stdio): customer not found', () => {
       assert.match(result.content[0].text, /Multiple customers found with email.*hand off to a support agent/);
       assert.doesNotMatch(result.content[0].text, /customer_found/);
     });
+  });
+
+  test('the not-found read list holds only get/search tools and no verified writes', () => {
+    const source = readFileSync(path.join(ROOT, 'src/server.js'), 'utf8');
+    const listed = (name) => [...source.match(new RegExp(`const ${name} = new Set\\(\\[([^\\]]*)\\]\\)`))[1].matchAll(/'([a-z_]+)'/g)].map(m => m[1]);
+    const reads = listed('HOSTED_NOT_FOUND_READ_TOOLS');
+    const writes = new Set(listed('VERIFIED_WRITE_TOOLS'));
+    assert.ok(reads.length > 0 && writes.size > 0);
+    for (const name of reads) {
+      assert.match(name, /^(get|search)_/, name);
+      assert.ok(!writes.has(name), name);
+    }
   });
 
   test('outside hosted mode an unknown customer is still an error', async t => {

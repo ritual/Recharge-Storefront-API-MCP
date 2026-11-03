@@ -421,8 +421,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: 'text',
             text: JSON.stringify({
               customer_found: false,
-              message: `${notFound} No Recharge customer uses this conversation's verified email, so there are no subscriptions, addresses or charges to show. ` +
-                'Looking up again returns the same result: lookups always use the verified email, never an email or number the customer types. ' +
+              message: `${notFound} No Recharge customer uses this conversation's verified email, so there is no account data to show. ` +
+                'Looking up again returns the same result, because lookups use this conversation\'s verified email. ' +
                 'Don\'t ask for account IDs or tokens.',
             }),
           },
