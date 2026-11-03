@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RechargeClient } from '../src/recharge-client.js';
 import { RechargeAPIError, handleAPIError } from '../src/utils/error-handler.js';
 import { CATALOG_SEARCH_MAX_QUERY, createShopifyCatalog, parseShopifyCatalogConfig } from '../src/utils/shopify-catalog.js';
@@ -3966,5 +3966,86 @@ describe('server (stdio)', () => {
         assert.match(stderr(), pattern);
       });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Server: hosted reads for an unknown verified email (no network)
+// ---------------------------------------------------------------------------
+
+// Preloaded into the server process: the admin customer lookup returns these customers, and any other admin request fails
+function stubCustomerLookup(t, customers) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'recharge-mcp-stub-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'stub-customer-lookup.mjs');
+  writeFileSync(file, [
+    `import { RechargeClient } from ${JSON.stringify(pathToFileURL(path.join(ROOT, 'src/recharge-client.js')).href)};`,
+    'RechargeClient.prototype.makeAdminRequest = async function (method, endpoint) {',
+    `  if (method === 'GET' && endpoint === '/customers') return { customers: ${JSON.stringify(customers)} };`,
+    '  throw new Error(`unexpected admin request ${method} ${endpoint}`);',
+    '};',
+  ].join('\n'));
+  return { NODE_OPTIONS: `--import ${pathToFileURL(file).href}` };
+}
+
+const UNKNOWN_EMAIL = 'Nobody@Example.com';
+
+describe('server (stdio): customer not found', () => {
+  test('hosted reads answer with customer_found false, not an error', async t => {
+    await withServer({ MCP_HOSTED_MODE: 'true', ...stubCustomerLookup(t, []) }, async ({ request }) => {
+      for (const [name, args] of [['get_subscriptions', {}], ['get_addresses', {}], ['get_charges', {}], ['get_subscription', { subscription_id: '1001' }]]) {
+        const result = await callTool(request, name, { customer_email: UNKNOWN_EMAIL, ...args });
+        assert.ok(!result.isError, name);
+        assert.equal(result.content.length, 1, name);
+        const body = JSON.parse(result.content[0].text);
+        assert.deepEqual(Object.keys(body), ['customer_found', 'message'], name);
+        assert.equal(body.customer_found, false, name);
+        // Client procedures branch on this literal phrase; the email is echoed as given
+        assert.ok(body.message.startsWith(`Customer not found with email: ${UNKNOWN_EMAIL}. No Recharge customer uses this conversation's verified email`), name);
+        assert.match(body.message, /no account data to show\. Looking up again returns the same result.*Don't ask for account IDs or tokens\.$/, name);
+        assert.doesNotMatch(body.message, /hand off/, name);
+      }
+    });
+  });
+
+  test('hosted writes and caller-email lookups for an unknown customer still refuse with an error', async t => {
+    await withServer({ MCP_HOSTED_MODE: 'true', ...stubCustomerLookup(t, []) }, async ({ request }) => {
+      for (const [name, args] of [['skip_subscription', { subscription_id: '1001', date: FUTURE_1 }], ['cancel_subscription', { subscription_id: '1001' }], ['get_customer_by_email', { email: UNKNOWN_EMAIL }]]) {
+        const result = await callTool(request, name, { customer_email: UNKNOWN_EMAIL, ...args });
+        assert.equal(result.isError, true, name);
+        assert.match(result.content[0].text, /hand off to a support agent/, name);
+        if (name !== 'get_customer_by_email') assert.match(result.content[0].text, /Customer not found with email/, name);
+        assert.doesNotMatch(result.content[0].text, /customer_found/, name);
+      }
+    });
+  });
+
+  test('hosted reads for an email shared by several customers stay an error with the hand-off', async t => {
+    await withServer({ MCP_HOSTED_MODE: 'true', ...stubCustomerLookup(t, [{ id: 1 }, { id: 2 }]) }, async ({ request }) => {
+      const result = await callTool(request, 'get_subscriptions', { customer_email: UNKNOWN_EMAIL });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /Multiple customers found with email.*hand off to a support agent/);
+      assert.doesNotMatch(result.content[0].text, /customer_found/);
+    });
+  });
+
+  test('the not-found read list holds only get/search tools and no verified writes', () => {
+    const source = readFileSync(path.join(ROOT, 'src/server.js'), 'utf8');
+    const listed = (name) => [...source.match(new RegExp(`const ${name} = new Set\\(\\[([^\\]]*)\\]\\)`))[1].matchAll(/'([a-z_]+)'/g)].map(m => m[1]);
+    const reads = listed('HOSTED_NOT_FOUND_READ_TOOLS');
+    const writes = new Set(listed('VERIFIED_WRITE_TOOLS'));
+    assert.ok(reads.length > 0 && writes.size > 0);
+    for (const name of reads) {
+      assert.match(name, /^(get|search)_/, name);
+      assert.ok(!writes.has(name), name);
+    }
+  });
+
+  test('outside hosted mode an unknown customer is still an error', async t => {
+    await withServer(stubCustomerLookup(t, []), async ({ request }) => {
+      const result = await callTool(request, 'get_subscriptions', { customer_email: UNKNOWN_EMAIL });
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, `Error: Customer not found with email: ${UNKNOWN_EMAIL}`);
+    });
   });
 });

@@ -57,6 +57,55 @@ const HOSTED_HANDOFF_HINT = 'Do not ask the customer for account IDs or tokens; 
 const HOSTED_IDENTITY_ERRORS = /Customer not found with email|Multiple customers found with email|No session token available/;
 
 /**
+ * Reads for which an unknown verified email is an expected outcome, not an
+ * error: in hosted mode they answer "Customer not found with email" (the
+ * phrase client procedures branch on) as a normal result with
+ * customer_found false, so the client does not retry the lookup. Each only
+ * sends GET requests for the customer identified by customer_email. Not
+ * listed: writes, get_customer_by_email (looks up a caller-supplied email),
+ * find_addable_product (refuses an unknown customer itself) and the session
+ * cache tools (no customer lookup).
+ */
+const HOSTED_NOT_FOUND_READ_TOOLS = new Set([
+  'get_customer',
+  'get_delivery_schedule',
+  'get_customer_portal_access',
+  'get_churn_landing_page_url',
+  'get_payment_recovery_url',
+  'get_gift_redemption_url',
+  'get_subscriptions',
+  'get_subscription',
+  'get_addresses',
+  'get_address',
+  'get_orders',
+  'get_order',
+  'get_payment_methods',
+  'get_payment_method',
+  'get_products',
+  'get_product',
+  'search_products',
+  'get_plans',
+  'get_plan',
+  'get_charges',
+  'get_charge',
+  'get_onetimes',
+  'get_onetime',
+  'get_bundles',
+  'get_bundle',
+  'get_bundle_selections',
+  'get_bundle_selection',
+  'get_shipping_countries',
+  'get_store_settings',
+  'get_collections',
+  'get_collection',
+  'get_collection_products',
+  'get_credit_summary',
+  'get_credit_accounts',
+  'get_gift_purchases',
+  'get_gift_purchase',
+]);
+
+/**
  * Verified admin writes: email-minted storefront sessions are read-only, so
  * set_subscription_next_charge, skip_subscription, skip_charge,
  * update_address, update_subscription (quantity only), create_onetime and
@@ -362,6 +411,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (error.stack) {
         console.error(`[DEBUG] Error stack:`, error.stack);
       }
+    }
+
+    if (hostedMode && HOSTED_NOT_FOUND_READ_TOOLS.has(name) && !error.verifiedRefusal && /^Customer not found with email: /.test(error.message || '')) {
+      const notFound = error.message.endsWith('.') ? error.message : `${error.message}.`;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              customer_found: false,
+              message: `${notFound} No Recharge customer uses this conversation's verified email, so there is no account data to show. ` +
+                'Looking up again returns the same result, because lookups use this conversation\'s verified email. ' +
+                'Don\'t ask for account IDs or tokens.',
+            }),
+          },
+        ],
+      };
     }
 
     if (hostedMode && HOSTED_IDENTITY_ERRORS.test(error.message || '') && !/hand off to a support agent/.test(error.message)) {
